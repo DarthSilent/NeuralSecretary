@@ -97,8 +97,8 @@ echo.
 
 :: Check if meeting_app.py exists
 if not exist meeting_app.py (
-    echo meeting_app.py not found. Downloading from GitHub...
-    powershell -Command "Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/DarthSilent/NeuralSecretary/main/meeting_app.py' -OutFile 'meeting_app.py'"
+    echo meeting_app.py not found. Downloading from Gist...
+    powershell -Command "Invoke-WebRequest -Uri 'https://gist.githubusercontent.com/DarthSilent/d356769ed61e38501fd868c1d2745218/raw/meeting_app.py' -OutFile 'meeting_app.py'"
     
     if not exist meeting_app.py (
         echo [ERROR] Failed to download meeting_app.py!
@@ -115,7 +115,7 @@ if not exist meeting_app.py (
 :: Check if USER_MANUAL.md exists
 if not exist USER_MANUAL.md (
     echo Downloading User Manual...
-    powershell -Command "Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/DarthSilent/NeuralSecretary/main/USER_MANUAL.md' -OutFile 'USER_MANUAL.md'" >nul 2>&1
+    powershell -Command "Invoke-WebRequest -Uri 'https://gist.githubusercontent.com/DarthSilent/d356769ed61e38501fd868c1d2745218/raw/USER_MANUAL.md' -OutFile 'USER_MANUAL.md'" >nul 2>&1
 )
 
 :: Create default settings.json
