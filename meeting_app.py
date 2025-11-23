@@ -6,7 +6,9 @@ from logging.handlers import RotatingFileHandler
 # --- 1. НАСТРОЙКА ПУТЕЙ ДЛЯ PORTABLE / PYINSTALLER ---
 if getattr(sys, "frozen", False):
     internal_path = sys._MEIPASS
-    external_path = os.path.dirname(sys.executable)
+    # Если это EXE, храним данные в Документах пользователя, чтобы не требовать прав админа
+    external_path = os.path.join(os.path.expanduser("~"), "Documents", "MeetingApp")
+    os.makedirs(external_path, exist_ok=True)
 else:
     internal_path = os.getcwd()
     external_path = os.getcwd()
