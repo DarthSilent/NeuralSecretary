@@ -45,6 +45,10 @@ from io import BytesIO
 from datetime import datetime, timedelta
 import threading
 import time
+class OperationCancelled(Exception): pass
+
+# Import file association manager
+from file_association_manager import FileAssociationManager
 
 # --- 2. НАСТРОЙКА ЛОГИРОВАНИЯ ---
 LOG_FILE = "meeting_app.log"
@@ -567,23 +571,21 @@ BUILTIN_PROMPTS = {
 OLLAMA_MODELS = {
     "Weak (CPU / <8GB VRAM)": [
         {"name": "Llama 3.2 3B", "id": "llama3.2:3b"},
-        {"name": "Qwen 2.5 7B", "id": "qwen2.5:7b"},
-        {"name": "Gemma 2 9B", "id": "gemma2:9b"},
+        {"name": "Qwen 3 8B", "id": "qwen3:8b"},
         {"name": "DeepSeek-R1 7B", "id": "deepseek-r1:7b"},
         {"name": "Mistral 7B", "id": "mistral"},
     ],
     "Medium (16-20GB VRAM)": [
-        {"name": "Qwen 2.5 14B", "id": "qwen2.5:14b"},
-        {"name": "Mistral Small 24B", "id": "mistral-small"},
-        {"name": "Gemma 2 27B", "id": "gemma2:27b"},
+        {"name": "GPT-OSS 20B", "id": "gpt-oss:20b"},
+        {"name": "Qwen 3 14B", "id": "qwen3:14b"},
         {"name": "DeepSeek-R1 14B", "id": "deepseek-r1:14b"},
-        {"name": "GPT-OSS", "id": "gpt-oss"},
+        {"name": "Gemma 3 27B", "id": "gemma3:27b"},
     ],
     "Pro (>20GB VRAM)": [
-        {"name": "Qwen 2.5 32B", "id": "qwen2.5:32b"},
-        {"name": "Llama 3.3 70B", "id": "llama3.3:70b"},
+        {"name": "Qwen 3 32B", "id": "qwen3:32b"},
         {"name": "DeepSeek-R1 32B", "id": "deepseek-r1:32b"},
-        {"name": "DeepSeek-R1 671B (Distill)", "id": "deepseek-r1:671b"},
+        {"name": "Llama 3.1 70B", "id": "llama3.1:70b"},
+        {"name": "DeepSeek-R1 671B", "id": "deepseek-r1:671b"},
     ],
 }
 
@@ -613,6 +615,7 @@ DEFAULT_SETTINGS = {
     "input_device": "Default",
     "rec_format": "wav",                # wav | mp3 (итоговый формат)
     "save_txt": True,
+    "remove_silence": False,
     "save_docx": True,
 }
 
@@ -755,19 +758,139 @@ class AudioRecorder:
     """
     Пишем всегда во временный WAV-файл, потом по выбору пользователя
     сохраняем как WAV или конвертируем в MP3.
+    Поддерживает паузу и замер уровня громкости.
     """
+
+
+    def _strip_silence_ffmpeg(self, input_path: str, output_path: str) -> bool:
+        """
+        Использует FFmpeg filter 'silenceremove' для удаления тишины.
+        Параметры: удалять всё, что тише -40dB и длится дольше 1 сек.
+        """
+        if not FFmpegInstaller.is_installed():
+            return False
+            
+        try:
+            # stop_periods=-1 : удалять все периоды тишины
+            # stop_duration=1 : считать тишиной куски > 1 сек
+            # stop_threshold=-40dB : порог громкости
+            cmd = [
+                "ffmpeg", "-y", "-i", input_path,
+                "-af", "silenceremove=stop_periods=-1:stop_duration=1:stop_threshold=-40dB",
+                output_path
+            ]
+            # Запускаем без открытия окна консоли
+            startupinfo = None
+            if os.name == 'nt':
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                
+            subprocess.run(
+                cmd, 
+                stdout=subprocess.DEVNULL, 
+                stderr=subprocess.DEVNULL,
+                check=True,
+                startupinfo=startupinfo
+            )
+            return True
+        except Exception as e:
+            print(f"Ошибка VAD FFmpeg: {e}")
+            return False
+
+    def stop(self, force_wav: bool = False) -> bool:
+        if not self.recording:
+            return False
+
+        self.recording = False
+        self.paused = False
+        self.current_volume = 0.0
+
+        try:
+            if self.stream:
+                self.stream.stop()
+                self.stream.close()
+        except Exception:
+            pass
+
+        if self.writer_thread:
+            self.writer_thread.join()
+
+        if not self.temp_filename or not os.path.exists(self.temp_filename):
+            return False
+
+        final_fmt = config.get("rec_format")
+        if force_wav:
+            final_fmt = "wav"
+
+        try:
+            dirpath = os.path.dirname(self.final_target)
+            if dirpath:
+                os.makedirs(dirpath, exist_ok=True)
+
+            # Проверяем, нужно ли удалять тишину
+            source_file = self.temp_filename
+            vad_applied = False
+            
+            if config.get("remove_silence"):
+                # Создаем промежуточный файл без тишины
+                vad_file = self.temp_filename.replace(".wav", "_vad.wav")
+                if self._strip_silence_ffmpeg(self.temp_filename, vad_file):
+                    source_file = vad_file
+                    vad_applied = True
+            
+            # Конвертация / Перемещение в финал
+            if final_fmt == "mp3":
+                if self.final_target.endswith(".wav"):
+                    self.final_target = self.final_target[:-4] + ".mp3"
+
+                AudioSegment.from_wav(source_file).export(
+                    self.final_target,
+                    format="mp3",
+                    bitrate="128k",
+                )
+            else:
+                if os.path.exists(self.final_target):
+                    os.remove(self.final_target)
+                # Если VAD создавал копию, перемещаем её, иначе оригинал
+                if vad_applied:
+                    shutil.move(source_file, self.final_target)
+                else:
+                    shutil.move(source_file, self.final_target)
+
+            # Чистка мусора
+            if os.path.exists(self.temp_filename):
+                os.remove(self.temp_filename)
+            if vad_applied and os.path.exists(source_file):
+                # Если вдруг move не сработал или остался хвост
+                try: os.remove(source_file)
+                except: pass
+
+            return True
+        except Exception as e:
+            print(f"Ошибка сохранения аудио: {e}")
+            return False
 
     def __init__(self):
         self.recording = False
+        self.paused = False  # Флаг паузы
         self.queue = queue.Queue()
         self.stream = None
         self.writer_thread = None
-        self.temp_filename = None  # всегда WAV
-        self.final_target = None   # финальный путь (с расширением пользователя)
+        self.temp_filename = None
+        self.final_target = None
+        self.current_volume = 0.0  # Текущая громкость (0.0 ... 1.0)
 
     def _callback(self, indata, frames, time_info, status):
         if self.recording:
-            self.queue.put(indata.copy())
+            # 1. Расчет громкости для визуализатора (RMS)
+            # Используем numpy для быстрого подсчета среднего
+            volume = np.linalg.norm(indata) / np.sqrt(len(indata))
+            # Усиливаем значение, чтобы полоска прыгала заметнее
+            self.current_volume = min(volume * 5, 1.0) 
+
+            # 2. Если не на паузе — пишем данные
+            if not self.paused:
+                self.queue.put(indata.copy())
 
     def _writer(self):
         with sf.SoundFile(
@@ -789,6 +912,9 @@ class AudioRecorder:
 
         self.final_target = target_filename
         self.temp_filename = f"temp_rec_{uuid.uuid4().hex}.wav"
+        self.recording = True
+        self.paused = False
+        self.current_volume = 0.0
 
         dev_conf = config.get("input_device")
         dev_id = None
@@ -798,7 +924,6 @@ class AudioRecorder:
             except ValueError:
                 dev_id = None
 
-        self.recording = True
         try:
             self.stream = sd.InputStream(
                 samplerate=16000,
@@ -814,12 +939,21 @@ class AudioRecorder:
 
         self.writer_thread = threading.Thread(target=self._writer, daemon=True)
         self.writer_thread.start()
+    
+    def toggle_pause(self):
+        """Переключатель паузы"""
+        if self.recording:
+            self.paused = not self.paused
+            return self.paused
+        return False
 
     def stop(self, force_wav: bool = False) -> bool:
         if not self.recording:
             return False
 
         self.recording = False
+        self.paused = False
+        self.current_volume = 0.0
 
         try:
             if self.stream:
@@ -844,7 +978,6 @@ class AudioRecorder:
                 os.makedirs(dirpath, exist_ok=True)
 
             if final_fmt == "mp3":
-                # если пользователь указал .wav, заменим на .mp3
                 if self.final_target.endswith(".wav"):
                     self.final_target = self.final_target[:-4] + ".mp3"
 
@@ -866,6 +999,118 @@ class AudioRecorder:
 
 
 # --- AI БЛОК: STT + ДИАРИЗАЦИЯ ---
+
+class AudioPlayer:
+    """
+    Проигрыватель аудио на базе sounddevice + pydub.
+    Позволяет играть, ставить на паузу и перематывать (seek).
+    """
+    def __init__(self):
+        self.data = None
+        self.fs = 44100
+        self.current_frame = 0
+        self.total_frames = 0
+        self.is_playing = False
+        self.stream = None
+        self.duration_sec = 0
+        
+    def load(self, path: str):
+        """Загружает аудиофайл и конвертирует в numpy array"""
+        self.stop()
+        try:
+            # Используем Pydub для унификации (читает mp3, wav, ogg...)
+            seg = AudioSegment.from_file(path)
+            
+            # Приводим к стандарту: моно, 44.1kHz (для стабильности воспроизведения)
+            seg = seg.set_frame_rate(44100).set_channels(1)
+            self.fs = 44100
+            self.duration_sec = len(seg) / 1000.0
+            
+            # Конвертация в numpy float32
+            # get_array_of_samples возвращает array.array (int)
+            samples = np.array(seg.get_array_of_samples(), dtype=np.float32)
+            
+            # Нормализация (pydub дает int16/int32, sounddevice хочет float -1..1)
+            # Обычно 16-бит, делим на 2^15
+            max_val = float(1 << (8 * seg.sample_width - 1))
+            self.data = samples / max_val
+            
+            self.total_frames = len(self.data)
+            self.current_frame = 0
+            return True
+        except Exception as e:
+            print(f"Ошибка загрузки плеера: {e}")
+            return False
+
+    def _callback(self, outdata, frames, time, status):
+        if not self.is_playing:
+            outdata.fill(0)
+            return
+
+        chunk_size = frames
+        remain = self.total_frames - self.current_frame
+        
+        if remain <= 0:
+            # Конец файла
+            outdata.fill(0)
+            self.is_playing = False
+            raise sd.CallbackStop()
+        
+        if remain < chunk_size:
+            # Последний кусочек
+            outdata[:remain, 0] = self.data[self.current_frame : self.current_frame + remain]
+            outdata[remain:, 0] = 0
+            self.current_frame += remain
+        else:
+            # Обычный кусок
+            outdata[:, 0] = self.data[self.current_frame : self.current_frame + chunk_size]
+            self.current_frame += chunk_size
+
+    def play(self):
+        if not self.data is None and not self.is_playing:
+            self.is_playing = True
+            # Запускаем поток, если он мертв или закрыт
+            if self.stream is None or not self.stream.active:
+                self.stream = sd.OutputStream(
+                    samplerate=self.fs,
+                    channels=1,
+                    callback=self._callback,
+                    finished_callback=self._on_finished
+                )
+                self.stream.start()
+
+    def pause(self):
+        self.is_playing = False
+        # Поток не убиваем, просто callback будет слать тишину или мы его остановим
+        if self.stream and self.stream.active:
+            self.stream.stop()
+            self.stream.close()
+            self.stream = None
+
+    def stop(self):
+        self.is_playing = False
+        self.current_frame = 0
+        if self.stream:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except: pass
+            self.stream = None
+
+    def seek(self, seconds: float):
+        if self.data is None: return
+        # Ограничиваем
+        seconds = max(0, min(seconds, self.duration_sec))
+        self.current_frame = int(seconds * self.fs)
+
+    def get_pos(self):
+        """Возвращает (текущая_секунда, всего_секунд)"""
+        if self.data is None: return 0, 0
+        curr = self.current_frame / self.fs
+        return curr, self.duration_sec
+
+    def _on_finished(self):
+        self.is_playing = False
 
 class AIProcessor:
     def __init__(self):
@@ -927,11 +1172,11 @@ class AIProcessor:
         wave, sr = torchaudio.load(wav_path)
         return self._emb_inference({"waveform": wave, "sample_rate": sr})
 
-    def analyze(self, path: str, voice_db: dict, log_cb):
+    def analyze(self, path: str, voice_db: dict, log_cb, stop_event=None):
         mode = config.get("processing_mode")
         if mode == "cloud":
             return self._analyze_cloud(path, voice_db, log_cb)
-        return self._analyze_local(path, voice_db, log_cb)
+        return self._analyze_local(path, voice_db, log_cb, stop_event)
 
     # --- Облако (Deepgram) ---
 
@@ -1043,10 +1288,16 @@ class AIProcessor:
 
     # --- Локальный режим (PyAnnote + faster-whisper) ---
 
-    def _analyze_local(self, path: str, voice_db: dict, log_cb):
+    def _analyze_local(self, path: str, voice_db: dict, log_cb, stop_event=None):
         log_cb("Локальный режим: диаризация...")
+        
+        # ПРОВЕРКА ОТМЕНЫ
+        if stop_event and stop_event.is_set(): raise OperationCancelled()
+        
         self._load_pipeline()
         diar = self._pipeline(path)
+        
+        if stop_event and stop_event.is_set(): raise OperationCancelled()
 
         if isinstance(diar, Annotation):
             ann = diar
@@ -1062,8 +1313,10 @@ class AIProcessor:
 
         os.makedirs(TEMP_DIR, exist_ok=True)
 
-        # 1. Нарезка аудио на кусочки по спикерам
+        # 1. Нарезка аудио
         for seg, _, label in ann.itertracks(yield_label=True):
+            if stop_event and stop_event.is_set(): raise OperationCancelled()
+            
             start_ms = int(seg.start * 1000)
             end_ms = int(seg.end * 1000)
             if end_ms - start_ms < 500:
@@ -1090,8 +1343,13 @@ class AIProcessor:
         batch_size = config.get("batch_size", 8)
         total_chunks = len(speaker_chunks)
         
-        # 2. Транскрипция текста (Whisper)
+        # 2. Транскрипция текста (Whisper) с проверкой отмены
         for batch_idx in range(0, total_chunks, batch_size):
+            # ПРОВЕРКА ОТМЕНЫ ПЕРЕД КАЖДЫМ ПАКЕТОМ
+            if stop_event and stop_event.is_set(): 
+                log_cb("Операция прервана пользователем.")
+                raise OperationCancelled()
+
             batch = speaker_chunks[batch_idx:batch_idx + batch_size]
             batch_num = (batch_idx // batch_size) + 1
             total_batches = (total_chunks + batch_size - 1) // batch_size
@@ -1099,7 +1357,7 @@ class AIProcessor:
             log_cb(f"Обработка пакета {batch_num}/{total_batches} ({len(batch)} фрагментов)...")
             
             for ch in batch:
-                # Конвертация в формат 16kHz для Whisper
+                # Конвертация в формат 16kHz
                 wav, sr = torchaudio.load(ch["file"])
                 if sr != 16000:
                     wav = torchaudio.functional.resample(wav, sr, 16000)
@@ -1109,7 +1367,6 @@ class AIProcessor:
                 try:
                     res, info = self._whisper_model.transcribe(ch["file"], beam_size=5)
                 except RuntimeError as e:
-                    # Fallback на CPU если CUDA упала
                     if "cublas" in str(e).lower() and self.device == "cuda":
                         self.device = "cpu"
                         self._whisper_model = None
@@ -1129,12 +1386,12 @@ class AIProcessor:
                     }
                 )
         
-        # --- БЛОК 3: ИДЕНТИФИКАЦИЯ (Этого не было в оригинале) ---
+        # 3. Идентификация (тоже добавим проверку)
         if voice_db:
+            if stop_event and stop_event.is_set(): raise OperationCancelled()
             log_cb("Идентификация спикеров по базе...")
             self._load_embedding_model()
             
-            # Находим самый длинный кусок аудио для каждого спикера (для лучшей точности)
             speaker_samples = {}
             for s in segments:
                 lbl = s["label"]
@@ -1143,56 +1400,44 @@ class AIProcessor:
                     speaker_samples[lbl] = {"audio": s["audio"], "dur": dur}
 
             mapping = {}
-            # ПОРОГ ПОХОЖЕСТИ (0.45 - строго, 0.6 - мягко)
-            # Если не узнает, попробуйте изменить на 0.55
             threshold = 0.55 
 
             for spk_label, data in speaker_samples.items():
+                if stop_event and stop_event.is_set(): raise OperationCancelled()
                 try:
-                    # Делаем слепок голоса из текущего файла
                     unknown_emb = self.create_embedding(data["audio"])
-                    
                     best_name = None
                     min_dist = 100.0
                     
-                    # Сравниваем со всеми голосами в базе
                     for name, db_data in voice_db.items():
-                        # Поддержка обоих форматов базы (старого и нового)
                         if isinstance(db_data, dict):
                             target_emb = db_data.get("embedding")
                         else:
                             target_emb = db_data
                             
-                        if target_emb is None:
-                            continue
+                        if target_emb is None: continue
 
-                        # Считаем насколько голоса похожи (0.0 - копия, 1.0 - разные люди)
                         dist = cosine_distance(unknown_emb, target_emb)
                         if dist < min_dist:
                             min_dist = dist
                             best_name = name
                     
-                    # Если похожесть выше порога - это наш человек
                     if min_dist < threshold and best_name:
                         mapping[spk_label] = best_name
                         log_cb(f"Узнал: {spk_label} -> {best_name} (точность: {1-min_dist:.2f})")
                 except Exception as e:
                     logger.error(f"Ошибка идентификации {spk_label}: {e}")
 
-            # Переименовываем всех найденных
             if mapping:
                 for s in segments:
                     if s["label"] in mapping:
                         s["label"] = mapping[s["label"]]
-        # -------------------------------------------------------
 
-        # 4. Подготовка тех, кого не узнали (для мастера обучения)
+        # 4. Сбор неизвестных
         unknown = {}
         for s in segments:
             label = s["label"]
-            # Если мы уже узнали этого человека, пропускаем
-            if label in voice_db:
-                continue
+            if label in voice_db: continue
             
             if label not in unknown:
                 unknown[label] = {
@@ -1476,81 +1721,72 @@ class LLMClient:
             
         return chunks
 
-    def summarize(self, transcript_text: str, progress_cb=None) -> str:
+    def summarize(self, transcript_text: str, progress_cb=None, stop_event=None) -> str:
         """
         Умная суммаризация с гибкой настройкой условий разбиения.
         """
-        # Актуальный системный промпт
         current_system_prompt = config.get("system_prompt") or ""
         current_system_prompt = current_system_prompt.replace(
             "{date}", datetime.now().strftime("%d.%m.%Y")
         )
 
-        # Считываем настройки
         token_limit = config.get("llm_token_limit", 12000)
         use_token_check = config.get("enable_token_limit", True)
         force_split = config.get("force_time_split", False)
 
         full_text_tokens = self._estimate_tokens(transcript_text)
-        
-        # ЛОГИКА ПРИНЯТИЯ РЕШЕНИЯ:
         should_split = force_split or (use_token_check and full_text_tokens > token_limit)
         
-        # --- ВЕТКА 1: ОДИН ПРОХОД ---
+        # ВЕТКА 1: ОДИН ПРОХОД
         if not should_split:
             if progress_cb:
                 msg = f"Транскрипт ({full_text_tokens} токенов). Обработка одним запросом..."
-                if full_text_tokens > token_limit:
-                    msg += " (Лимит превышен, но разбивка отключена)"
+                if full_text_tokens > token_limit: msg += " (Лимит превышен)"
                 progress_cb(msg)
-            return self._call_llm_stream(current_system_prompt, transcript_text, progress_cb)
+            return self._call_llm_stream(current_system_prompt, transcript_text, progress_cb, stop_event)
         
-        # --- ВЕТКА 2: ИТЕРАТИВНЫЙ РЕЖИМ ---
+        # ВЕТКА 2: ИТЕРАТИВНЫЙ РЕЖИМ
         chunks = self._split_transcript_by_time(transcript_text)
         total_chunks = len(chunks)
         
         if total_chunks <= 1:
-            if progress_cb:
-                progress_cb(f"Попытка разбивки, но запись короче заданного интервала. Обработка целиком...")
-            return self._call_llm_stream(current_system_prompt, transcript_text, progress_cb)
+            return self._call_llm_stream(current_system_prompt, transcript_text, progress_cb, stop_event)
 
         if progress_cb:
             chunk_min = config.get('chunk_minutes', 55)
             reason = "Принудительно" if force_split else "Превышен лимит токенов"
-            progress_cb(f"Режим: Итеративный ({reason}). Разбито на {total_chunks} частей (по ~{chunk_min} мин).")
+            progress_cb(f"Режим: Итеративный ({reason}). Разбито на {total_chunks} частей.")
 
         intermediate_results = []
         
         for i, chunk in enumerate(chunks):
+            # ПРОВЕРКА ОТМЕНЫ
+            if stop_event and stop_event.is_set(): raise OperationCancelled()
+            
             part_num = i + 1
             if progress_cb:
                 progress_cb(f"Анализ части {part_num}/{total_chunks}...")
             
             chunk_system_prompt = (
-                f"Ты анализируешь ЧАСТЬ {part_num} из {total_chunks} записи встречи.\n"
-                f"Твоя задача — извлечь информацию из этого фрагмента, СТРОГО следуя роли и формату, описанным ниже.\n"
-                f"Не пиши вступлений и общих выводов по всей встрече, пиши только то, что найдено в этом куске.\n\n"
-                f"=== ТВОЯ РОЛЬ И КРИТЕРИИ АНАЛИЗА ===\n"
-                f"{current_system_prompt}\n"
-                f"====================================\n"
+                f"Ты анализируешь ЧАСТЬ {part_num} из {total_chunks}.\n"
+                f"Твоя задача — извлечь информацию из этого фрагмента, СТРОГО следуя роли ниже.\n"
+                f"=== ТВОЯ РОЛЬ ===\n{current_system_prompt}\n"
             )
             
             part_response = self._call_llm(chunk_system_prompt, chunk, stream=False)
             intermediate_results.append(f"--- ОТЧЕТ ПО ЧАСТИ {part_num} ---\n{part_response}\n")
         
-        # Финальная сборка
         if progress_cb:
             progress_cb("Консолидация финального отчета...")
             
         combined_text = "\n".join(intermediate_results)
         final_user_message = (
-            "Ниже приведены промежуточные отчеты по разным частям одной встречи.\n"
-            "Объедини их в один связный финальный документ, соблюдая структуру, заданную в системном промпте.\n"
-            "Убери дублирующиеся пункты, объедини смысловые блоки.\n\n"
-            f"МАТЕРИАЛЫ ДЛЯ ОБЪЕДИНЕНИЯ:\n{combined_text}"
+            "Ниже приведены промежуточные отчеты. Объедини их в один связный финальный документ.\n\n"
+            f"МАТЕРИАЛЫ:\n{combined_text}"
         )
         
-        return self._call_llm_stream(current_system_prompt, final_user_message, progress_cb)
+        return self._call_llm_stream(current_system_prompt, final_user_message, progress_cb, stop_event)
+
 
     def _prepare_request_data(self, system_prompt, user_text, stream=True):
         messages = [
@@ -1591,6 +1827,7 @@ class LLMClient:
         return url, headers, data
 
     def _call_llm(self, system_prompt, user_text, stream=False) -> str:
+    
         url, headers, data = self._prepare_request_data(system_prompt, user_text, stream=False)
         try:
             resp = requests.post(url, headers=headers, json=data)
@@ -1604,7 +1841,7 @@ class LLMClient:
         except Exception as e:
             return f"Error: {e}"
 
-    def _call_llm_stream(self, system_prompt, user_text, progress_cb) -> str:
+    def _call_llm_stream(self, system_prompt, user_text, progress_cb, stop_event=None) -> str:
         url, headers, data = self._prepare_request_data(system_prompt, user_text, stream=True)
         try:
             resp = requests.post(url, headers=headers, json=data, stream=True)
@@ -1617,6 +1854,10 @@ class LLMClient:
 
             collected_text = []
             for line in resp.iter_lines():
+                # ПРОВЕРКА ОТМЕНЫ ВО ВРЕМЯ СТРИМИНГА
+                if stop_event and stop_event.is_set():
+                    raise OperationCancelled()
+
                 if line:
                     decoded_line = line.decode('utf-8').strip()
                     if decoded_line.startswith("data: "):
@@ -1636,6 +1877,8 @@ class LLMClient:
                             pass
             return "".join(collected_text)
 
+        except OperationCancelled:
+            raise # Прокидываем наверх
         except Exception as e:
             return f"Ошибка соединения с LLM: {e}"
 
@@ -2127,7 +2370,257 @@ class AddSpeakerDialog(ctk.CTkToplevel):
             self.after(0, lambda: self.progress.stop())
             self.after(0, lambda: self.progress.pack_forget())
             self.after(0, lambda: self.status_label.configure(text=f"Ошибка: {e}"))
+class MicTesterWindow(ctk.CTkToplevel):
+    def __init__(self, parent, device_name):
+        super().__init__(parent)
+        self.title("Тест микрофона")
+        self.geometry("400x150")
+        self.device_name = device_name
+        self.stream = None
+        self.running = True
+        
+        # UI
+        ctk.CTkLabel(self, text=f"Устройство: {device_name}", font=("Segoe UI", 12, "bold")).pack(pady=(15, 5))
+        
+        self.progress = ctk.CTkProgressBar(self, width=300, height=20, mode="determinate")
+        self.progress.pack(pady=10)
+        self.progress.set(0.0)
+        
+        self.lbl_status = ctk.CTkLabel(self, text="Слушаю сигнал...", text_color="gray")
+        self.lbl_status.pack(pady=5)
+        
+        ctk.CTkButton(self, text="Закрыть", command=self.destroy, fg_color="#e74c3c", hover_color="#c0392b").pack(pady=10)
+        
+        # Запуск потока чтения
+        self.thread = threading.Thread(target=self._listen_loop, daemon=True)
+        self.thread.start()
 
+    def _listen_loop(self):
+        # Парсим ID устройства
+        dev_id = None
+        if self.device_name and ":" in self.device_name:
+            try:
+                dev_id = int(self.device_name.split(":")[0])
+            except ValueError:
+                pass
+        
+        def callback(indata, frames, time, status):
+            if not self.running:
+                raise sd.CallbackStop()
+            
+            # Расчет громкости (RMS)
+            vol = np.linalg.norm(indata) / np.sqrt(len(indata))
+            # Нормализация для UI (усиление x5)
+            vol_ui = min(vol * 5, 1.0)
+            
+            # Безопасное обновление UI
+            try:
+                if self.winfo_exists():
+                    self.progress.set(vol_ui)
+            except:
+                pass
+
+        try:
+            with sd.InputStream(device=dev_id, channels=1, callback=callback, samplerate=16000):
+                while self.running and self.winfo_exists():
+                    sd.sleep(100)
+        except Exception as e:
+            if self.winfo_exists():
+                self.lbl_status.configure(text=f"Ошибка: {e}")
+
+    def destroy(self):
+        self.running = False
+        super().destroy()
+
+# --- UI КОМПОНЕНТЫ ---
+
+class TranscriptSegment(ctk.CTkFrame):
+    def __init__(self, parent, start_time: float, end_time: float, speaker: str, text: str, 
+                 on_seek=None, voice_db=None):
+        super().__init__(parent, fg_color=("gray85", "gray20"), corner_radius=8)
+        self.start_time = start_time
+        self.end_time = end_time
+        self.on_seek = on_seek
+        
+        # Layout: [Time] [Speaker] [Text]
+        self.grid_columnconfigure(2, weight=1)
+        
+        # 1. Time Button (Click-to-Seek)
+        time_str = self._format_time(start_time)
+        self.time_btn = ctk.CTkButton(
+            self, 
+            text=f"⏱ {time_str}", 
+            width=80, 
+            height=28,
+            fg_color=("gray70", "gray30"),
+            hover_color=("gray60", "gray40"),
+            command=self._on_time_click
+        )
+        self.time_btn.grid(row=0, column=0, padx=5, pady=5, sticky="nw")
+        
+        # 2. Speaker Selector
+        speakers = sorted(list(voice_db.keys())) if voice_db else []
+        if speaker not in speakers:
+            speakers.append(speaker)
+            
+        self.speaker_var = ctk.StringVar(value=speaker)
+        self.speaker_menu = ctk.CTkOptionMenu(
+            self,
+            variable=self.speaker_var,
+            values=speakers,
+            width=140,
+            height=28
+        )
+        self.speaker_menu.grid(row=0, column=1, padx=5, pady=5, sticky="nw")
+        
+        # 3. Text Editor
+        # Use Textbox for multi-line support
+        self.text_box = ctk.CTkTextbox(
+            self, 
+            height=60, 
+            font=("Segoe UI", 12),
+            wrap="word",
+            activate_scrollbars=False
+        )
+        self.text_box.grid(row=0, column=2, padx=5, pady=5, sticky="ew")
+        self.text_box.insert("0.0", text)
+        
+        # Auto-resize height based on text content (simple heuristic)
+        lines = text.count('\n') + (len(text) // 80) + 1
+        new_height = min(max(lines * 20, 40), 150)
+        self.text_box.configure(height=new_height)
+
+    def _format_time(self, seconds: float) -> str:
+        m = int(seconds // 60)
+        s = int(seconds % 60)
+        return f"{m:02d}:{s:02d}"
+
+    def _on_time_click(self):
+        if self.on_seek:
+            self.on_seek(self.start_time)
+
+    def get_data(self):
+        return {
+            "start": self.start_time,
+            "end": self.end_time,
+            "label": self.speaker_var.get(),
+            "text": self.text_box.get("0.0", "end").strip()
+        }
+
+# --- LINK FILES DIALOG ---
+
+class LinkFilesDialog(ctk.CTkToplevel):
+    """Dialog for manually linking audio and transcript files"""
+    def __init__(self, parent, file_assoc, log_cb):
+        super().__init__(parent)
+        self.title("Привязка файлов")
+        self.geometry("600x250")
+        self.file_assoc = file_assoc
+        self.log_cb = log_cb
+        
+        self.audio_path = None
+        self.transcript_path = None
+        
+        self._build_ui()
+        self.lift()
+        self.focus_force()
+        self.grab_set()
+    
+    def _build_ui(self):
+        # Audio file section
+        ctk.CTkLabel(
+            self, text="Аудио файл:", font=("Segoe UI", 14, "bold")
+        ).pack(pady=(20, 5))
+        
+        audio_frame = ctk.CTkFrame(self)
+        audio_frame.pack(fill="x", padx=20, pady=5)
+        
+        self.audio_label = ctk.CTkLabel(
+            audio_frame, text="Файл не выбран", text_color="gray"
+        )
+        self.audio_label.pack(side="left", padx=10)
+        
+        ctk.CTkButton(
+            audio_frame, text="📁 Обзор", width=100,
+            command=self._pick_audio
+        ).pack(side="right", padx=10, pady=5)
+        
+        # Transcript file section
+        ctk.CTkLabel(
+            self, text="Транскрипт:", font=("Segoe UI", 14, "bold")
+        ).pack(pady=(15, 5))
+        
+        transcript_frame = ctk.CTkFrame(self)
+        transcript_frame.pack(fill="x", padx=20, pady=5)
+        
+        self.transcript_label = ctk.CTkLabel(
+            transcript_frame, text="Файл не выбран", text_color="gray"
+        )
+        self.transcript_label.pack(side="left", padx=10)
+        
+        ctk.CTkButton(
+            transcript_frame, text="📁 Обзор", width=100,
+            command=self._pick_transcript
+        ).pack(side="right", padx=10, pady=5)
+        
+        # Buttons
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=20)
+        
+        ctk.CTkButton(
+            btn_frame, text="✅ Связать", width=120,
+            fg_color="green", hover_color="#006400",
+            command=self._link_files
+        ).pack(side="left", padx=10)
+        
+        ctk.CTkButton(
+            btn_frame, text="❌ Отмена", width=120,
+            fg_color="gray", hover_color="darkgray",
+            command=self.destroy
+        ).pack(side="left", padx=10)
+    
+    def _pick_audio(self):
+        path = filedialog.askopenfilename(
+            title="Выбрать аудио файл",
+            filetypes=[
+                ("Audio Files", "*.wav *.mp3 *.m4a *.flac"),
+                ("All Files", "*.*")
+            ]
+        )
+        if path:
+            self.audio_path = path
+            self.audio_label.configure(
+                text=os.path.basename(path),
+                text_color=("black", "white")
+            )
+    
+    def _pick_transcript(self):
+        path = filedialog.askopenfilename(
+            title="Выбрать транскрипт",
+            filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")]
+        )
+        if path:
+            self.transcript_path = path
+            self.transcript_label.configure(
+                text=os.path.basename(path),
+                text_color=("black", "white")
+            )
+    
+    def _link_files(self):
+        if not self.audio_path or not self.transcript_path:
+            messagebox.showwarning(
+                "Внимание",
+                "Пожалуйста, выберите оба файла"
+            )
+            return
+        
+        try:
+            self.file_assoc.associate(self.audio_path, self.transcript_path)
+            self.log_cb(f"✅ Файлы связаны: {os.path.basename(self.audio_path)} ↔ {os.path.basename(self.transcript_path)}")
+            messagebox.showinfo("Успех", "Файлы успешно связаны!")
+            self.destroy()
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось связать файлы:\n{e}")
 
 # --- ОСНОВНОЕ ОКНО ПРИЛОЖЕНИЯ ---
 
@@ -2139,6 +2632,7 @@ class App(ctk.CTk):
         super().__init__()
         self.title(APP_TITLE)
         self.geometry("1200x800")
+        self.stop_event = threading.Event()
 
 
 
@@ -2155,11 +2649,16 @@ class App(ctk.CTk):
         self.ai = AIProcessor()
         self.llm = LLMClient()
         self.gdrive = GDriveClient(self._log)
+        self.file_assoc = FileAssociationManager()  # File association manager
+
+        self.player = AudioPlayer()
 
         self.is_recording = False
         self.record_start_time = 0
         self.last_transcript_text = ""
         self.last_basename = ""
+        self.current_audio_path = None  # Track current audio file for associations
+        self.current_transcript_path = None  # Track current transcript file
 
         self._build_ui()
 
@@ -2171,6 +2670,7 @@ class App(ctk.CTk):
                     "Не задан HF Token. Идентификация голосов работать не будет.",
                 ),
             )
+
 
     def _get_host_dirs(self, host_name: str):
         """
@@ -2256,6 +2756,227 @@ class App(ctk.CTk):
             except:
                 pass
 
+    def _toggle_log_box(self):
+        if self.log_box_visible:
+            self.log_box.grid_remove()
+            self.log_toggle_btn.configure(text="▶ Показать системный лог")
+            self.log_box_visible = False
+        else:
+            self.log_box.grid(row=8, column=0, sticky="nsew", pady=5)
+            self.log_toggle_btn.configure(text="▼ Скрыть системный лог")
+            self.log_box_visible = True
+
+    def _render_transcript(self, segments):
+        """Render transcript segments as cards"""
+        # Clear existing
+        for widget in self.transcript_scroll.winfo_children():
+            widget.destroy()
+            
+        if not segments:
+            return
+
+        for seg in segments:
+            card = TranscriptSegment(
+                self.transcript_scroll,
+                start_time=seg["start"],
+                end_time=seg["end"],
+                speaker=seg["label"],
+                text=seg["text"],
+                on_seek=self._player_seek_to,
+                voice_db=self.voice_db
+            )
+            card.pack(fill="x", pady=2, padx=2)
+
+    def _player_seek_to(self, seconds):
+        """Seek player to specific time"""
+        if self.player:
+            self.player.seek(seconds)
+            # Update slider
+            if hasattr(self, 'player_slider'):
+                self.player_slider.set(seconds)
+            # If paused, maybe play a bit? Or just update frame.
+            # Let's just seek. User can press play.
+
+    def _collect_transcript_from_ui(self) -> str:
+        """Reconstruct transcript text from UI segments"""
+        text_parts = []
+        for widget in self.transcript_scroll.winfo_children():
+            if isinstance(widget, TranscriptSegment):
+                data = widget.get_data()
+                # Format: [00:15] Speaker: Text
+                time_str = widget._format_time(data["start"])
+                text_parts.append(f"[{time_str}] {data['label']}: {data['text']}")
+        return "\n".join(text_parts)
+
+    def _save_transcript_changes(self):
+        """Save edited transcript to file"""
+        # Collect current transcript from UI
+        transcript_text = self._collect_transcript_from_ui()
+        
+        if not transcript_text:
+            self._log("Нет данных для сохранения")
+            return
+        
+        # Determine save path
+        if self.current_transcript_path and os.path.exists(self.current_transcript_path):
+            # Save to existing file
+            save_path = self.current_transcript_path
+        else:
+            # Ask user where to save
+            save_path = filedialog.asksaveasfilename(
+                defaultextension=".txt",
+                filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")],
+                initialfile=f"{self.last_basename}.txt" if self.last_basename else "transcript.txt"
+           )
+            if not save_path:
+                return
+        
+        try:
+            with open(save_path, 'w', encoding='utf-8') as f:
+                f.write(transcript_text)
+            
+            self.current_transcript_path = save_path
+            self.last_transcript_text = transcript_text
+            
+            # Create association if we have audio
+            if self.current_audio_path:
+                self.file_assoc.associate(self.current_audio_path, save_path)
+                self._log(f"✅ Транскрипт сохранён и привязан к аудио")
+            else:
+                self._log(f"✅ Транскрипт сохранён: {os.path.basename(save_path)}")
+                
+        except Exception as e:
+            self._log(f"Ошибка сохранения: {e}")
+            messagebox.showerror("Ошибка", f"Не удалось сохранить файл:\n{e}")
+    
+    def _show_link_files_dialog(self):
+        """Show dialog to manually link audio and transcript files"""
+        LinkFilesDialog(self, self.file_assoc, self._log)
+
+    def _parse_and_render_transcript(self, text):
+        """Parse transcript text and render as segments"""
+        import re
+        segments = []
+        
+        for idx, line in enumerate(text.strip().split('\n')):
+            if not line.strip():
+                continue
+            
+            # Try format: [time] Speaker: Text
+            match = re.match(r'\[(\d+\.?\d*)\]\s*([^:]+):\s*(.+)', line)
+            if match:
+                try:
+                    time_val = float(match.group(1))
+                    speaker = match.group(2).strip()
+                    txt = match.group(3).strip()
+                    segments.append({
+                        "start": time_val,
+                        "end": time_val + 5.0,
+                        "label": speaker,
+                        "text": txt
+                    })
+                    continue
+                except:
+                    pass
+            
+            # Try format: Speaker: Text (no time)
+            match2 = re.match(r'([^:]+):\s*(.+)', line)
+            if match2:
+                speaker = match2.group(1).strip()
+                txt = match2.group(2).strip()
+                segments.append({
+                    "start": idx * 10.0,
+                    "end": (idx + 1) * 10.0,
+                    "label": speaker,
+                    "text": txt
+                })
+        
+        if segments:
+            self._render_transcript(segments)
+            self._log(f"✅ Отображено {len(segments)} сегментов")
+    
+    def _rename_speaker(self, old_name):
+        """Rename a speaker in the voice database"""
+        # Create dialog for new name
+        dialog = ctk.CTkInputDialog(
+            text=f"Введите новое имя для '{old_name}':",
+            title="Переименование голоса"
+        )
+        new_name = dialog.get_input()
+        
+        if not new_name or new_name.strip() == "":
+            return
+        
+        new_name = new_name.strip()
+        
+        # Check if name already exists
+        if new_name in self.voice_db and new_name != old_name:
+            messagebox.showerror("Ошибка", f"Голос с именем '{new_name}' уже существует!")
+            return
+        
+        # Same name - nothing to do
+        if new_name == old_name:
+            return
+        
+        try:
+            # Transfer data
+            self.voice_db[new_name] = self.voice_db[old_name]
+            del self.voice_db[old_name]
+            
+            # Rename samples directory if exists
+            import glob
+            old_dir = os.path.join(SAMPLES_DIR, sanitize_filename(old_name))
+            new_dir = os.path.join(SAMPLES_DIR, sanitize_filename(new_name))
+            
+            if os.path.exists(old_dir):
+                os.rename(old_dir, new_dir)
+            
+            # Save changes
+            self._save_db()
+            self._refresh_host_menu()
+            self._log(f"✅ Голос переименован: '{old_name}' → '{new_name}'")
+            
+            # Refresh voices page
+            if hasattr(self, 'current_page') and self.current_page == "voices":
+                self._show_voices_page()
+            
+            messagebox.showinfo("Успех", f"Голос успешно переименован на '{new_name}'!")
+            
+        except Exception as e:
+            self._log(f"Ошибка переименования: {e}")
+            messagebox.showerror("Ошибка", f"Не удалось переименовать голос:\n{e}")
+
+    # === ВОТ ЭТИ МЕТОДЫ НУЖНО ВСТАВИТЬ С ОТСТУПОМ (4 ПРОБЕЛА) ===
+
+    def _cancel_processing(self):
+        """Вызывается при нажатии кнопки Отмена"""
+        if messagebox.askyesno("Отмена", "Прервать текущую операцию?"):
+            self.stop_event.set()
+            self._log("Запрос на отмену отправлен...")
+            self.cancel_btn.configure(state="disabled", text="Остановка...")
+
+    def _show_progress_ui(self, show=True):
+        """Показывает/скрывает прогресс бар и кнопку отмены"""
+        if show:
+            self.stop_event.clear() # Сброс флага перед стартом
+            self.progress.pack(side="right", padx=10)
+            self.progress.start()
+            self.cancel_btn.configure(state="normal", text="❌ ОТМЕНА")
+            self.cancel_btn.pack(side="right", padx=5)
+        else:
+            self.progress.stop()
+            self.progress.pack_forget()
+            self.cancel_btn.pack_forget()
+
+    def _enable_report_buttons(self):
+        """Хелпер для безопасного включения кнопок отчета"""
+        if hasattr(self, "report_button_live") and self.report_button_live.winfo_exists():
+            self.report_button_live.configure(state="normal")
+        if hasattr(self, "report_button_file") and self.report_button_file.winfo_exists():
+            self.report_button_file.configure(state="normal")
+        if hasattr(self, "save_transcript_btn") and self.save_transcript_btn.winfo_exists():
+            self.save_transcript_btn.configure(state="normal")
+
     # --- UI ---
 
     def _build_ui(self):
@@ -2312,17 +3033,22 @@ class App(ctk.CTk):
         self.status_bar = ctk.CTkFrame(self, height=30, corner_radius=0)
         self.status_bar.grid(row=1, column=0, columnspan=2, sticky="ew")
         
-        self.status_label = ctk.CTkLabel(
-            self.status_bar, 
-            text="Готов", 
-            anchor="w"
-        )
+        self.status_label = ctk.CTkLabel(self.status_bar, text="Готов", anchor="w")
         self.status_label.pack(side="left", padx=10)
         
-        self.progress = ctk.CTkProgressBar(self.status_bar, mode="indeterminate", width=200)
-        # Progress bar hidden by default
+        # Кнопка отмены (справа)
+        self.cancel_btn = ctk.CTkButton(
+            self.status_bar, 
+            text="❌ ОТМЕНА", 
+            fg_color="#c0392b", 
+            hover_color="#e74c3c",
+            width=100,
+            command=self._cancel_processing
+        )
+        # Не делаем pack сразу, будем показывать только при работе
         
-        # Show default page
+        self.progress = ctk.CTkProgressBar(self.status_bar, mode="indeterminate", width=200)
+        
         self._show_recording_page()
     
     def _clear_content(self):
@@ -2355,59 +3081,83 @@ class App(ctk.CTk):
             container,
             text="Запись встречи",
             font=("Segoe UI", 24, "bold")
-        ).grid(row=0, column=0, pady=(0, 30))
+        ).grid(row=0, column=0, pady=(0, 20))
         
         # Host selection
         ctk.CTkLabel(
-            container,
-            text="Ведущий встречи:",
-            font=("Segoe UI", 14)
+            container, text="Ведущий встречи:", font=("Segoe UI", 14)
         ).grid(row=1, column=0, sticky="w", pady=(0, 5))
         
         self.host_menu = ctk.CTkOptionMenu(
-            container,
-            values=[""],
-            width=400,
-            height=35
+            container, values=[""], width=400, height=35
         )
         self.host_menu.grid(row=2, column=0, pady=(0, 20))
         self._refresh_host_menu()
         
         # Topic input
         ctk.CTkLabel(
-            container,
-            text="Тема встречи:",
-            font=("Segoe UI", 14)
+            container, text="Тема встречи:", font=("Segoe UI", 14)
         ).grid(row=3, column=0, sticky="w", pady=(0, 5))
         
         self.topic_entry = ctk.CTkEntry(
-            container,
-            width=400,
-            height=35,
-            placeholder_text="Введите тему..."
+            container, width=400, height=35, placeholder_text="Введите тему..."
         )
-        self.topic_entry.grid(row=4, column=0, pady=(0, 30))
+        self.topic_entry.grid(row=4, column=0, pady=(0, 20))
         
+        # --- ВИЗУАЛИЗАТОР ЗВУКА ---
+        self.vu_meter_frame = ctk.CTkFrame(container, fg_color="transparent")
+        self.vu_meter_frame.grid(row=5, column=0, pady=(0, 10))
+        
+        ctk.CTkLabel(self.vu_meter_frame, text="Уровень сигнала:").pack(anchor="w")
+        self.vu_meter = ctk.CTkProgressBar(
+            self.vu_meter_frame, 
+            width=400, 
+            height=15, 
+            orientation="horizontal",
+            mode="determinate"
+        )
+        self.vu_meter.pack(pady=5)
+        self.vu_meter.set(0.0)
+        # Скрываем, пока запись не идет
+        self.vu_meter_frame.grid_remove() 
+        # ---------------------------
+
         # Timer
         self.timer_label = ctk.CTkLabel(
-            container,
-            text="00:00",
-            font=("Segoe UI", 48, "bold")
+            container, text="00:00", font=("Segoe UI", 48, "bold")
         )
-        self.timer_label.grid(row=5, column=0, pady=20)
+        self.timer_label.grid(row=6, column=0, pady=10)
         
-        # Record button
+        # Buttons Frame
+        btn_frame = ctk.CTkFrame(container, fg_color="transparent")
+        btn_frame.grid(row=7, column=0, pady=20)
+        
+        # Pause Button
+        self.pause_button = ctk.CTkButton(
+            btn_frame,
+            text="⏸ Пауза",
+            width=120,
+            height=50,
+            font=("Segoe UI", 14, "bold"),
+            fg_color="#f39c12",
+            hover_color="#d35400",
+            state="disabled",
+            command=self._toggle_pause
+        )
+        self.pause_button.pack(side="left", padx=10)
+
+        # Record Button
         self.record_button = ctk.CTkButton(
-            container,
+            btn_frame,
             text="⏺ Начать запись",
-            width=300,
+            width=200,
             height=60,
             font=("Segoe UI", 16, "bold"),
             fg_color="green",
             hover_color="#006400",
             command=self._toggle_recording
         )
-        self.record_button.grid(row=6, column=0, pady=20)
+        self.record_button.pack(side="left", padx=10)
         
         # Report button
         self.report_button_live = ctk.CTkButton(
@@ -2419,17 +3169,18 @@ class App(ctk.CTk):
             state="disabled",
             command=self._generate_report
         )
-        self.report_button_live.grid(row=7, column=0, pady=10)
+        self.report_button_live.grid(row=8, column=0, pady=10)
     
     def _show_analysis_page(self):
-        """Show the analysis page"""
+        """Show the analysis page with Audio Player"""
         self._clear_content()
         self._highlight_nav_button("📊 Анализ")
         
         container = ctk.CTkFrame(self.content_frame)
         container.grid(row=0, column=0, sticky="nsew", padx=40, pady=30)
         container.grid_columnconfigure(0, weight=1)
-        container.grid_rowconfigure(6, weight=1) # Увеличили индекс ряда для растягивания
+        # Ряд 8 (где лог) должен растягиваться
+        container.grid_rowconfigure(8, weight=1) 
         
         # Title
         ctk.CTkLabel(
@@ -2438,63 +3189,141 @@ class App(ctk.CTk):
             font=("Segoe UI", 24, "bold")
         ).grid(row=0, column=0, pady=(0, 20))
         
-        # File selection (Audio)
+        # File selection buttons
+        btn_frame = ctk.CTkFrame(container, fg_color="transparent")
+        btn_frame.grid(row=1, column=0, pady=5)
+        
         ctk.CTkButton(
-            container,
+            btn_frame,
             text="📂 Выбрать аудиофайл",
-            width=300,
-            height=50,
-            font=("Segoe UI", 14),
+            width=200,
             command=self._pick_file
-        ).grid(row=1, column=0, pady=5)
+        ).pack(side="left", padx=5)
         
-        # --- НОВАЯ КНОПКА: Текстовый транскрипт ---
         ctk.CTkButton(
-            container,
-            text="📄 Загрузить транскрипт (.txt)",
-            width=300,
-            height=50,
-            font=("Segoe UI", 14),
-            fg_color="#506673", # Другой цвет для отличия
-            hover_color="#3e525e",
+            btn_frame,
+            text="📄 Загрузить транскрипт",
+            width=200,
+            fg_color="#506673",
             command=self._pick_transcript_file
-        ).grid(row=2, column=0, pady=5)
-        # ------------------------------------------
-
-        self.selected_file_label = ctk.CTkLabel(
-            container,
-            text="",
-            font=("Segoe UI", 12),
-            wraplength=600
-        )
-        self.selected_file_label.grid(row=3, column=0, pady=10)
+        ).pack(side="left", padx=5)
         
-        # Report button
-        self.report_button_file = ctk.CTkButton(
-            container,
-            text="📄 Сформировать отчёт",
-            width=300,
+        self.selected_file_label = ctk.CTkLabel(container, text="", font=("Segoe UI", 12))
+        self.selected_file_label.grid(row=2, column=0, pady=5)
+
+        # === АУДИО ПЛЕЕР ===
+        self.player_frame = ctk.CTkFrame(container)
+        self.player_frame.grid(row=3, column=0, sticky="ew", pady=10)
+        self.player_frame.grid_columnconfigure(1, weight=1)
+        # Скрываем по умолчанию, пока файл не выбран
+        self.player_frame.grid_remove()
+
+        # Кнопка Play/Pause
+        self.player_btn = ctk.CTkButton(
+            self.player_frame, text="▶", width=40, height=40,
+            font=("Segoe UI", 20),
+            command=self._player_toggle
+        )
+        self.player_btn.grid(row=0, column=0, padx=10, pady=10)
+        
+        # Слайдер (Seek bar)
+        self.player_slider = ctk.CTkSlider(
+            self.player_frame, from_=0, to=100,
+            command=self._player_on_slide
+        )
+        self.player_slider.grid(row=0, column=1, sticky="ew", padx=10)
+        self.player_slider.set(0)
+        
+        # Время 00:00 / 00:00
+        self.player_time_lbl = ctk.CTkLabel(
+            self.player_frame, text="00:00 / 00:00", font=("Consolas", 12)
+        )
+        self.player_time_lbl.grid(row=0, column=2, padx=10)
+        # ===================
+
+        # Report buttons and Actions
+        actions_frame = ctk.CTkFrame(container, fg_color="transparent")
+        actions_frame.grid(row=4, column=0, pady=20)
+        
+        # Save Transcript Button
+        self.save_transcript_btn = ctk.CTkButton(
+            actions_frame,
+            text="💾 Сохранить транскрипт",
+            width=200,
             height=50,
-            font=("Segoe UI", 14),
+            font=("Segoe UI", 13),
+            state="disabled",
+            command=self._save_transcript_changes
+        )
+        self.save_transcript_btn.pack(side="left", padx=5)
+        
+        # Link Files Button
+        self.link_files_btn = ctk.CTkButton(
+            actions_frame,
+            text="🔗 Привязать файлы",
+            width=180,
+            height=50,
+            font=("Segoe UI", 13),
+            command=self._show_link_files_dialog
+        )
+        self.link_files_btn.pack(side="left", padx=5)
+        
+        # Report Button
+        self.report_button_file = ctk.CTkButton(
+            actions_frame,
+            text="📄 Сформировать отчёт",
+            width=220,
+            height=50,
+            font=("Segoe UI", 14, "bold"),
             state="disabled",
             command=self._generate_report
         )
-        self.report_button_file.grid(row=4, column=0, pady=20)
+        self.report_button_file.pack(side="left", padx=5)
         
-        # Transcript area (scrollable)
+        # Log/Transcript
         ctk.CTkLabel(
             container,
-            text="Стенограмма / Лог:",
+            text="Стенограмма (можно править):",
             font=("Segoe UI", 14, "bold")
-        ).grid(row=5, column=0, sticky="w", pady=(10, 5))
+        ).grid(row=5, column=0, sticky="w", pady=(5, 5))
+        
+        # Scrollable frame for segments
+        self.transcript_scroll = ctk.CTkScrollableFrame(
+            container,
+            height=400,
+            label_text="Фрагменты"
+        )
+        self.transcript_scroll.grid(row=6, column=0, sticky="nsew", pady=5)
+        self.transcript_scroll.grid_columnconfigure(0, weight=1)
+        
+        # Keep log_box for system messages, but smaller/hidden or separate tab?
+        # Let's add a small log area below or make it a tab.
+        # For now, let's keep it but minimized or accessible via toggle?
+        # Or just log to status bar and console.
+        # Let's add a "System Log" expander or just put it at the bottom.
+        
+        self.log_expander = ctk.CTkFrame(container)
+        self.log_expander.grid(row=7, column=0, sticky="ew", pady=5)
+        
+        self.log_box_visible = False
+        self.log_toggle_btn = ctk.CTkButton(
+            self.log_expander,
+            text="▶ Показать системный лог",
+            command=self._toggle_log_box,
+            fg_color="transparent",
+            text_color=("gray10", "gray90"),
+            anchor="w"
+        )
+        self.log_toggle_btn.pack(fill="x")
         
         self.log_box = ctk.CTkTextbox(
             container,
-            height=300,
+            height=150,
             wrap="word",
-            font=("Consolas", 11)
+            font=("Consolas", 10)
         )
-        self.log_box.grid(row=6, column=0, sticky="nsew", pady=5)
+        # Don't grid log_box initially
+
     
     def _show_voices_page(self):
         """Show the voices management page"""
@@ -2624,6 +3453,17 @@ class App(ctk.CTk):
                     )
                 ).grid(row=0, column=2, padx=5)
             
+            # Rename button
+            ctk.CTkButton(
+                speaker_frame,
+                text="✏️",
+                width=30,
+                height=28,
+                fg_color="#228be6",
+                hover_color="#1c7ed6",
+                command=lambda n=name: self._rename_speaker(n)
+            ).grid(row=0, column=3, padx=5)
+            
             # Delete button
             ctk.CTkButton(
                 speaker_frame,
@@ -2633,7 +3473,7 @@ class App(ctk.CTk):
                 fg_color="#c92a2a",
                 hover_color="#a61e1e",
                 command=lambda n=name: self._remove_speaker_by_name(n)
-            ).grid(row=0, column=3, padx=5)
+            ).grid(row=0, column=4, padx=5)
             
             row += 1
     
@@ -2679,6 +3519,13 @@ class App(ctk.CTk):
             variable=self.settings_theme_var,
             command=self._change_theme
         ).pack(fill="x", padx=20, pady=5)
+
+        self.settings_remove_silence_var = ctk.BooleanVar(value=config.get("remove_silence", False))
+        ctk.CTkCheckBox(
+            tab_audio, 
+            text="✂️ Удалять тишину из записи (VAD)", 
+            variable=self.settings_remove_silence_var
+        ).pack(anchor="w", padx=20, pady=10)
         
         if not FFmpegInstaller.is_installed():
             ctk.CTkButton(
@@ -2691,14 +3538,29 @@ class App(ctk.CTk):
             ).pack(pady=10, padx=20)
         
         # --- АУДИО ---
+        # --- АУДИО ---
         ctk.CTkLabel(
             tab_audio, text="Входной микрофон:", font=("Segoe UI", 12, "bold")
         ).pack(anchor="w", padx=20, pady=(10, 5))
+        
         self.settings_device_var = ctk.StringVar(value=config.get("input_device"))
         devices = AudioHelper.get_devices() or ["Default"]
+        
+        # Фрейм для выпадающего списка и кнопки теста
+        mic_frame = ctk.CTkFrame(tab_audio, fg_color="transparent")
+        mic_frame.pack(fill="x", padx=20, pady=5)
+        
         ctk.CTkOptionMenu(
-            tab_audio, variable=self.settings_device_var, values=devices
-        ).pack(fill="x", padx=20, pady=5)
+            mic_frame, variable=self.settings_device_var, values=devices, width=300
+        ).pack(side="left", padx=(0, 10))
+        
+        ctk.CTkButton(
+            mic_frame, 
+            text="🔊 Тест", 
+            width=80,
+            fg_color="#506673",
+            command=self._open_mic_tester
+        ).pack(side="left")
         
         ctk.CTkLabel(
             tab_audio, text="Формат записи:", font=("Segoe UI", 12, "bold")
@@ -3026,6 +3888,12 @@ class App(ctk.CTk):
         entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
         entry.insert(0, config.get(config_key, ""))
         setattr(self, f"settings_entry_{config_key}", entry)
+
+    def _open_mic_tester(self):
+        """Открывает окно проверки микрофона"""
+        dev = self.settings_device_var.get()
+        # Передаем self как родителя и имя выбранного устройства
+        MicTesterWindow(self, dev)
     
     def _open_url(self, url: str):
         """Open URL in default browser"""
@@ -3311,6 +4179,7 @@ class App(ctk.CTk):
         # Audio
         config.set("input_device", self.settings_device_var.get())
         config.set("rec_format", self.settings_rec_format_var.get())
+        config.set("remove_silence", self.settings_remove_silence_var.get())
         
         # STT
         config.set("processing_mode", self.settings_processing_mode_var.get())
@@ -3831,6 +4700,7 @@ class App(ctk.CTk):
 
     def _toggle_recording(self):
         if not self.is_recording:
+            # --- НАЧАЛО ЗАПИСИ ---
             host = self.host_menu.get()
             if not host or "Добавьте" in host:
                 self._log("Нужно выбрать ведущего встречи.")
@@ -3840,35 +4710,81 @@ class App(ctk.CTk):
             safe_topic = sanitize_filename(topic)
             date_prefix = datetime.now().strftime("%Y-%m-%d")
             
-            # Get host-specific directories
             rec_dir, _, _ = self._get_host_dirs(host)
-            
             filename = f"{date_prefix}_{safe_topic}_{sanitize_filename(host)}.{config.get('rec_format')}"
             full_path = os.path.join(rec_dir, filename)
 
             self.recorder.start(full_path)
             self.is_recording = True
             self.record_start_time = time.time()
-            self.record_button.configure(
-                text="Остановить запись", fg_color="red"
-            )
+            
+            # UI обновления
+            self.record_button.configure(text="⏹ Остановить", fg_color="red", hover_color="#8b0000")
+            self.pause_button.configure(state="normal", text="⏸ Пауза", fg_color="#f39c12")
+            
+            # Показываем визуализатор
+            self.vu_meter_frame.grid()
+            
             self._update_timer()
+            self._update_vu_meter() # Запускаем обновление полоски
         else:
+            # --- ОСТАНОВКА ЗАПИСИ ---
             self.recorder.stop()
+            full_path = self.recorder.final_target
+            self._load_player(full_path)
+            
+            # Сразу анализ
+            self._start_analysis(full_path)
             self.is_recording = False
-            self.record_button.configure(
-                text="Начать запись", fg_color="green"
-            )
-            # анализ только что записанного файла
+            
+            # UI обновления
+            self.record_button.configure(text="⏺ Начать запись", fg_color="green", hover_color="#006400")
+            self.pause_button.configure(state="disabled", text="⏸ Пауза")
+            self.timer_label.configure(text="00:00")
+            
+            # Скрываем визуализатор
+            self.vu_meter_frame.grid_remove()
+            
+            # Сразу анализ
             full_path = self.recorder.final_target
             self._start_analysis(full_path)
 
+    def _toggle_pause(self):
+        """Обработка кнопки Пауза"""
+        if not self.is_recording:
+            return
+            
+        is_paused = self.recorder.toggle_pause()
+        if is_paused:
+            self.pause_button.configure(text="▶ Продолжить", fg_color="#2ecc71", hover_color="#27ae60")
+            self._log("Запись приостановлена")
+            # Корректируем время старта, чтобы таймер не скакнул при возобновлении
+            # (упрощенно: просто замораживаем таймер в UI)
+        else:
+            self.pause_button.configure(text="⏸ Пауза", fg_color="#f39c12", hover_color="#d35400")
+            self._log("Запись возобновлена")
+            # При возобновлении нам нужно сдвинуть record_start_time, 
+            # но для простоты визуализации пока оставим как есть.
+            
+    def _update_vu_meter(self):
+        """Обновление полоски громкости"""
+        if self.is_recording and hasattr(self, 'vu_meter'):
+            vol = self.recorder.current_volume
+            self.vu_meter.set(vol)
+            # Если запись идет, планируем следующее обновление через 50мс
+            self.after(50, self._update_vu_meter)
+
     def _update_timer(self):
         if self.is_recording:
-            elapsed = int(time.time() - self.record_start_time)
-            self.timer_label.configure(
-                text=f"{elapsed // 60:02}:{elapsed % 60:02}"
-            )
+            # Если пауза, таймер визуально стоит (хотя время "грязное" может идти, 
+            # но мы пишем только полезный сигнал, так что логично не крутить счетчик)
+            if not self.recorder.paused:
+                # В идеале здесь нужно считать "чистое" время записи,
+                # но для простоты пока оставим отсечку от старта.
+                # Для версии 1.0 можно сделать Accumulator времени.
+                elapsed = int(time.time() - self.record_start_time)
+                self.timer_label.configure(text=f"{elapsed // 60:02}:{elapsed % 60:02}")
+            
             self.after(1000, self._update_timer)
 
     # --- обработка файла ---
@@ -3878,38 +4794,104 @@ class App(ctk.CTk):
         if not path:
             return
         self.selected_file_label.configure(text=os.path.basename(path))
+        
+        # Store audio path for associations
+        self.current_audio_path = path
+        
+        # Check for associated transcript
+        transcript_path = self.file_assoc.get_transcript(path)
+        if transcript_path and os.path.exists(transcript_path):
+            self._log(f"🔗 Найден связанный транскрипт: {os.path.basename(transcript_path)}")
+            # Load transcript into UI
+            try:
+                with open(transcript_path, 'r', encoding='utf-8') as f:
+                    text = f.read()
+                self.last_transcript_text = text
+                self.current_transcript_path = transcript_path
+                
+                # Parse and display if possible
+                self._parse_and_render_transcript(text)
+                
+                # Enable save button
+                if hasattr(self, 'save_transcript_btn'):
+                    self.save_transcript_btn.configure(state="normal")
+            except Exception as e:
+                self._log(f"Ошибка загрузки транскрипта: {e}")
+        
+        # Load audio to player
+        self._load_player(path)
+        
+        # Run analysis
         self._start_analysis(path)
 
-    def _pick_transcript_file(self):
-        """Загрузка готового текстового файла для генерации отчета"""
-        path = filedialog.askopenfilename(filetypes=[("Text Files", "*.txt")])
-        if not path:
+    def _load_player(self, path):
+        """Загрузка файла в плеер и отображение UI"""
+        self._log(f"Загрузка аудио в плеер: {os.path.basename(path)}...")
+        # Запускаем загрузку в потоке, чтобы не морозить GUI на больших файлах
+        threading.Thread(target=self._load_player_thread, args=(path,), daemon=True).start()
+
+    def _load_player_thread(self, path):
+        success = self.player.load(path)
+        if success:
+            self.after(0, self._player_ui_ready)
+        else:
+            self._log("❌ Ошибка загрузки аудио для плеера.")
+
+    def _player_ui_ready(self):
+        """Активация UI плеера после загрузки"""
+        if not hasattr(self, "player_frame"): return
+        
+        self.player_frame.grid() # Показываем плеер
+        self.player_slider.configure(from_=0, to=self.player.duration_sec)
+        self.player_slider.set(0)
+        self.player_btn.configure(text="▶")
+        self._update_player_time_lbl(0, self.player.duration_sec)
+        self._log("Аудио готово к воспроизведению.")
+        # Запуск цикла обновления UI
+        self._player_update_loop()
+
+    def _player_toggle(self):
+        """Play/Pause"""
+        if self.player.is_playing:
+            self.player.pause()
+            self.player_btn.configure(text="▶")
+        else:
+            self.player.play()
+            self.player_btn.configure(text="⏸")
+
+    def _player_on_slide(self, value):
+        """Перемотка (вызывается при движении слайдера)"""
+        self.player.seek(float(value))
+        # Если перематываем, обновляем лейбл сразу
+        curr, total = self.player.get_pos()
+        self._update_player_time_lbl(curr, total)
+
+    def _update_player_time_lbl(self, curr, total):
+        def fmt(s):
+            m = int(s // 60)
+            sec = int(s % 60)
+            return f"{m:02}:{sec:02}"
+        self.player_time_lbl.configure(text=f"{fmt(curr)} / {fmt(total)}")
+
+    def _player_update_loop(self):
+        """Периодическое обновление слайдера и времени при проигрывании"""
+        # Проверяем, существует ли плеер на экране
+        if not hasattr(self, "player_frame") or not self.player_frame.winfo_exists():
             return
             
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                text = f.read()
+        if self.player.is_playing:
+            curr, total = self.player.get_pos()
+            # Обновляем слайдер, только если пользователь его не тащит (сложно отследить в ctk, 
+            # поэтому просто обновляем, ctk обычно справляется)
+            self.player_slider.set(curr)
+            self._update_player_time_lbl(curr, total)
             
-            # Сохраняем текст в переменную, которую использует генератор отчетов
-            self.last_transcript_text = text
-            self.last_basename = os.path.splitext(os.path.basename(path))[0]
-            
-            # Обновляем UI
-            self.selected_file_label.configure(text=f"Транскрипт: {os.path.basename(path)}")
-            
-            # Показываем текст в окне лога для проверки
-            self.log_box.delete("0.0", "end")
-            self.log_box.insert("0.0", text)
-            
-            # Активируем кнопку генерации отчета
-            if hasattr(self, "report_button_file") and self.report_button_file.winfo_exists():
-                self.report_button_file.configure(state="normal")
-            
-            self._log(f"Загружен транскрипт: {os.path.basename(path)}")
-            self._log("Теперь можно нажать 'Сформировать отчёт' для теста промптов.")
-            
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось прочитать файл:\n{e}")
+            # Если доиграло до конца
+            if curr >= total and total > 0:
+                self.player_btn.configure(text="▶")
+        
+        # Повторяем каждые 250 мс
+        self.after(250, self._player_update_loop)
 
     def _pick_transcript_file(self):
         """Загрузка готового текстового файла для генерации отчета"""
@@ -3921,47 +4903,61 @@ class App(ctk.CTk):
             with open(path, "r", encoding="utf-8") as f:
                 text = f.read()
             
-            # Сохраняем текст в переменную, которую использует генератор отчетов
+            # Save transcript data
             self.last_transcript_text = text
             self.last_basename = os.path.splitext(os.path.basename(path))[0]
+            self.current_transcript_path = path
             
-            # Обновляем UI
+            # Update UI
             self.selected_file_label.configure(text=f"Транскрипт: {os.path.basename(path)}")
             
-            # Показываем текст в окне лога для проверки
-            self.log_box.delete("0.0", "end")
-            self.log_box.insert("0.0", text)
+            # Parse and render using helper method
+            self._parse_and_render_transcript(text)
             
-            # Активируем кнопку генерации отчета
+            # Check for associated audio file
+            audio_path = self.file_assoc.get_audio(path)
+            if audio_path and os.path.exists(audio_path):
+                self._log(f"🔗 Найден связанный аудио файл: {os.path.basename(audio_path)}")
+                self.current_audio_path = audio_path
+                self._load_player(audio_path)
+            
+            # Enable buttons
             if hasattr(self, "report_button_file") and self.report_button_file.winfo_exists():
                 self.report_button_file.configure(state="normal")
             
+            if hasattr(self, "save_transcript_btn") and self.save_transcript_btn.winfo_exists():
+                self.save_transcript_btn.configure(state="normal")
+            
             self._log(f"Загружен транскрипт: {os.path.basename(path)}")
-            self._log("Теперь можно нажать 'Сформировать отчёт' для теста промптов.")
             
         except Exception as e:
+            self._log(f"Ошибка загрузки: {e}")
             messagebox.showerror("Ошибка", f"Не удалось прочитать файл:\n{e}")
 
     def _start_analysis(self, path: str):
         self._log("Запуск анализа аудио...")
-        self.progress.pack(side="right", padx=10)
-        self.progress.start()
         threading.Thread(target=self._run_analysis, args=(path,), daemon=True).start()
 
     def _run_analysis(self, path: str):
         try:
+            self.after(0, lambda: self._show_progress_ui(True)) # Показываем UI
+            
             try:
                 logger.info(f"Starting analysis of: {path}")
-                segments, unknown = self.ai.analyze(path, self.voice_db, self._log)
+                # ПЕРЕДАЕМ self.stop_event
+                segments, unknown = self.ai.analyze(path, self.voice_db, self._log, self.stop_event)
                 logger.info(f"Analysis completed. Segments: {len(segments)}, Unknown: {len(unknown)}")
+            except OperationCancelled:
+                self._log("⚠️ Анализ отменен пользователем.")
+                return # Выходим, не сохраняя ничего
             except Exception as e:
                 self._log(f"Ошибка анализа: {e}")
                 logger.error(f"Analysis failed: {e}", exc_info=True)
-                self._stop_progress()
                 return
 
             if unknown:
                 self._log("Обнаружены неизвестные голоса, запускаю мастер...")
+                # При мастере отмену пока не обрабатываем, там UI
                 wizard = IdentifyWizard(self, unknown, self.voice_db)
                 self.wait_window(wizard)
                 
@@ -3972,7 +4968,6 @@ class App(ctk.CTk):
                         try:
                             emb = self.ai.create_embedding(sample["audio"])
                             
-                            # ИСПРАВЛЕНИЕ 1: Сохраняем в правильном формате (dict), а не просто array
                             if name in self.voice_db and isinstance(self.voice_db[name], dict):
                                 self.voice_db[name]["embedding"] = emb
                                 self.voice_db[name]["trained"] = True
@@ -3986,7 +4981,6 @@ class App(ctk.CTk):
                             logger.error(f"Error creating embedding for {name}: {e}")
 
                 self._save_db()
-                # ИСПРАВЛЕНИЕ 2: Удален вызов self._update_speakers_box(), который вызывал краш
                 self._refresh_host_menu()
                 
                 # переименуем метки в сегментах
@@ -4003,6 +4997,9 @@ class App(ctk.CTk):
             )
             self.last_transcript_text = transcript
             self.last_basename = os.path.splitext(os.path.basename(path))[0]
+            
+            # Render segments in UI
+            self.after(0, lambda: self._render_transcript(segments))
 
             if config.get("save_txt"):
                 host_name = "Unknown_Host"
@@ -4025,39 +5022,29 @@ class App(ctk.CTk):
                 with open(txt_path, "w", encoding="utf-8") as f:
                     f.write(transcript)
                 self._log(f"Сохранена стенограмма: {txt_path}")
-                if config.get("use_gdrive"):
-                    threading.Thread(
-                        target=lambda: self.gdrive.upload(txt_path),
-                        daemon=True,
-                    ).start()
+                
+                # Store transcript path and create association
+                self.current_transcript_path = txt_path
+                if hasattr(self, 'current_audio_path') and self.current_audio_path:
+                    self.file_assoc.associate(self.current_audio_path, txt_path)
+                    self._log("🔗 Создана связь аудио ↔ транскрипт")
+                
+                if config.get("save_srt"):
+                     srt_path = os.path.join(trans_dir, f"{self.last_basename}.srt")
+                     SRTGenerator.create_srt(segments, srt_path)
+                     self._log(f"Сохранены субтитры: {srt_path}")
 
-            # Безопасное включение кнопок (предыдущее исправление)
-            def enable_buttons_safely():
-                if hasattr(self, "report_button_live") and self.report_button_live is not None:
-                    try:
-                        if self.report_button_live.winfo_exists():
-                            self.report_button_live.configure(state="normal")
-                    except Exception:
-                        pass
-
-                if hasattr(self, "report_button_file") and self.report_button_file is not None:
-                    try:
-                        if self.report_button_file.winfo_exists():
-                            self.report_button_file.configure(state="normal")
-                    except Exception:
-                        pass
-
-            self.after(0, enable_buttons_safely)
-            self._stop_progress()
+            # Включаем кнопки через новый хелпер
+            self.after(0, lambda: self._enable_report_buttons())
 
         finally:
+            self.after(0, lambda: self._show_progress_ui(False)) # Скрываем UI
             if os.path.exists(TEMP_DIR):
-                try:
-                    shutil.rmtree(TEMP_DIR)
-                    logger.info(f"Cleaned up temp directory: {TEMP_DIR}")
-                except Exception as e:
-                    logger.warning(f"Failed to cleanup temp directory: {e}")
+                try: shutil.rmtree(TEMP_DIR)
+                except: pass
 
+   
+    
     def _stop_progress(self):
         self.after(
             0,
@@ -4074,56 +5061,65 @@ class App(ctk.CTk):
             self._log("Нет стенограммы для отчёта.")
             return
 
-        self.progress.pack(side="right", padx=10)
-        self.progress.start()
         # Show status (assuming status_label exists or using log)
         self._log("Генерация отчёта...")
         
         threading.Thread(target=self._llm_report_thread, daemon=True).start()
 
     def _llm_report_thread(self):
-        # Переменная для подсчета активности
-        self._gen_counter = 0
+        self.after(0, lambda: self._show_progress_ui(True))
+        self._token_counter = 0
         
-        def on_progress(chunk):
-            self._gen_counter += 1
-            # Обновляем UI каждые 5 чанков, чтобы не "мигало" слишком часто
-            if self._gen_counter % 5 == 0:
-                msg = f"Генерация отчёта... (принято токенов: {self._gen_counter})"
-                # Используем after для безопасного обновления из потока
-                self.after(0, lambda: self.status_label.configure(text=msg))
+        def on_progress(data):
+            is_status_msg = (len(data) > 80 or data.startswith("Анализ") or data.startswith("Сборка") or data.startswith("Режим"))
+            if is_status_msg:
+                self.after(0, lambda: self.status_label.configure(text=data))
+            else:
+                self._token_counter += 1
+                if self._token_counter % 2 == 0:
+                    msg = f"Генерация... ({self._token_counter} ток.)"
+                    self.after(0, lambda: self.status_label.configure(text=msg))
 
-        # Передаем наш callback в функцию
-        report = self.llm.summarize(self.last_transcript_text, progress_cb=on_progress)
-        
-        if config.get("save_docx"):
-            host_name = "Unknown_Host"
-            try:
-                parts = self.last_basename.split("_")
-                if len(parts) >= 3:
-                    host_name = parts[-1]
-                elif hasattr(self, "host_menu"):
-                    val = self.host_menu.get()
-                    if val and "Добавьте" not in val:
-                        host_name = val
-            except Exception:
-                pass
-
-            _, _, rep_dir = self._get_host_dirs(host_name)
+        try:
+            # Collect transcript from UI (with user edits!)
+            transcript_text = self._collect_transcript_from_ui()
             
-            docx_path = os.path.join(
-                rep_dir, f"{self.last_basename}_report.docx"
-            )
-            DocxGenerator.create_report(report, docx_path)
-            self._log(f"Сохранён отчёт: {docx_path}")
+            # Fallback to last_transcript_text if UI is empty
+            if not transcript_text and self.last_transcript_text:
+                transcript_text = self.last_transcript_text
             
-            # Возвращаем статус "Готов"
-            self.after(0, lambda: self.status_label.configure(text=f"Отчёт готов! ({self._gen_counter} токенов)"))
+            if not transcript_text:
+                self._log("Нет данных для генерации отчёта")
+                return
+            
+            # ПЕРЕДАЕМ stop_event
+            report = self.llm.summarize(transcript_text, progress_cb=on_progress, stop_event=self.stop_event)
+            
+            if config.get("save_docx"):
+                host_name = "Unknown_Host"
+                try:
+                    parts = self.last_basename.split("_")
+                    if len(parts) >= 3: host_name = parts[-1]
+                    elif hasattr(self, "host_menu"): 
+                         val = self.host_menu.get()
+                         if val and "Добавьте" not in val: host_name = val
+                except: pass
+                _, _, rep_dir = self._get_host_dirs(host_name)
+                docx_path = os.path.join(rep_dir, f"{self.last_basename}_report.docx")
+                DocxGenerator.create_report(report, docx_path)
+                self._log(f"Сохранён отчёт: {docx_path}")
+                final_msg = f"Отчёт готов! ({self._token_counter} ток.)"
+                self.after(0, lambda: self.status_label.configure(text=final_msg))
 
-            if config.get("use_gdrive"):
-                self.gdrive.upload(docx_path)
-        
-        self._stop_progress()
+                if config.get("use_gdrive"):
+                    self.gdrive.upload(docx_path)
+
+        except OperationCancelled:
+            self._log("⚠️ Генерация отчета прервана пользователем.")
+        except Exception as e:
+            self._log(f"Ошибка LLM: {e}")
+        finally:
+            self.after(0, lambda: self._show_progress_ui(False))
 
     # --- работа с базой спикеров ---
 
