@@ -30,9 +30,27 @@ ENV/
 # Application Data (Private)
 Meeting_Records/
 Voice_Samples/
+Speaker_Samples/
 voice_db.pkl
 meeting_app.log
 settings.json
+
+# Enrollment files (temporary voice recordings)
+enroll_*.wav
+
+# Build artifacts
+Output/
+*.exe
+*.ico
+convert_icon.py
+
+# Helper modules (if not part of main app)
+files_browser_methods.py
+
+# Test/Demo files
+*.mp3
+*.m4a
+*.ogg
 
 # IDEs
 .vscode/

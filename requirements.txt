@@ -1,0 +1,36 @@
+# Core Dependencies
+customtkinter>=5.2.0
+tkinter-tooltip>=2.1.0
+
+# Audio Processing
+sounddevice>=0.4.6
+soundfile>=0.12.1
+pydub>=0.25.1
+
+# Machine Learning / AI
+torch>=2.0.0
+torchaudio>=2.0.0
+faster-whisper>=0.10.0
+pyannote.audio>=3.1.0
+scipy>=1.11.0
+
+# API Clients
+requests>=2.31.0
+deepgram-sdk>=3.0.0
+
+# Google Drive (optional)
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
+google-auth-httplib2>=0.1.1
+google-api-python-client>=2.100.0
+
+# Document Generation
+python-docx>=1.0.0
+
+# System Resource Monitoring
+psutil>=5.9.0
+GPUtil>=1.4.0
+
+# NVIDIA CUDA Support (for GPU acceleration)
+nvidia-cublas-cu12>=12.1.0.26
+nvidia-cudnn-cu12>=8.9.0.131
