@@ -45,10 +45,26 @@ from io import BytesIO
 from datetime import datetime, timedelta
 import threading
 import time
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+
+try:
+    import GPUtil
+    GPUTIL_AVAILABLE = True
+except ImportError:
+    GPUTIL_AVAILABLE = False
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
 class OperationCancelled(Exception): pass
 
-# Import file association manager
-from file_association_manager import FileAssociationManager
+
 
 # --- 2. НАСТРОЙКА ЛОГИРОВАНИЯ ---
 LOG_FILE = "meeting_app.log"
@@ -203,7 +219,7 @@ except ImportError:
 
 # --- КОНСТАНТЫ И НАСТРОЙКИ ---
 
-APP_TITLE = "Нейро Стенографист v0.5 Beta"
+APP_TITLE = "Нейро Стенографист v0.6 Beta"
 
 DB_FILE = "voice_db.pkl"
 SETTINGS_FILE = "settings.json"
@@ -637,6 +653,73 @@ RETRAIN_TEXT = (
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
+
+
+# --- МЕНЕДЖЕР АССОЦИАЦИЙ ФАЙЛОВ ---
+class FileAssociationManager:
+    """
+    Manages associations between audio files and their transcripts.
+    Stores data in a JSON file.
+    """
+    def __init__(self, db_file="file_associations.json"):
+        self.db_file = db_file
+        self.associations = self._load_db()
+
+    def _load_db(self):
+        if not os.path.exists(self.db_file):
+            return {"audio_to_transcript": {}, "transcript_to_audio": {}}
+        try:
+            with open(self.db_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load associations DB: {e}")
+            return {"audio_to_transcript": {}, "transcript_to_audio": {}}
+
+    def _save_db(self):
+        try:
+            with open(self.db_file, "w", encoding="utf-8") as f:
+                json.dump(self.associations, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"Failed to save associations DB: {e}")
+
+    def associate(self, audio_path: str, transcript_path: str):
+        """Link an audio file with a transcript file"""
+        # Normalize paths
+        audio_path = os.path.abspath(audio_path)
+        transcript_path = os.path.abspath(transcript_path)
+        
+        self.associations["audio_to_transcript"][audio_path] = transcript_path
+        self.associations["transcript_to_audio"][transcript_path] = audio_path
+        self._save_db()
+        logger.info(f"Associated {os.path.basename(audio_path)} <-> {os.path.basename(transcript_path)}")
+
+    def get_transcript(self, audio_path: str) -> str:
+        """Get transcript path for an audio file"""
+        audio_path = os.path.abspath(audio_path)
+        return self.associations["audio_to_transcript"].get(audio_path)
+
+    def get_audio(self, transcript_path: str) -> str:
+        """Get audio path for a transcript file"""
+        transcript_path = os.path.abspath(transcript_path)
+        return self.associations["transcript_to_audio"].get(transcript_path)
+
+    def remove_association(self, path: str):
+        """Remove associations for a given file (audio or transcript)"""
+        path = os.path.abspath(path)
+        
+        # Check if it's an audio file
+        if path in self.associations["audio_to_transcript"]:
+            transcript = self.associations["audio_to_transcript"].pop(path)
+            if transcript in self.associations["transcript_to_audio"]:
+                del self.associations["transcript_to_audio"][transcript]
+                
+        # Check if it's a transcript file
+        if path in self.associations["transcript_to_audio"]:
+            audio = self.associations["transcript_to_audio"].pop(path)
+            if audio in self.associations["audio_to_transcript"]:
+                del self.associations["audio_to_transcript"][audio]
+                
+        self._save_db()
 
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
@@ -2627,6 +2710,179 @@ class LinkFilesDialog(ctk.CTkToplevel):
 import pickle
 
 
+# --- RESOURCE MONITOR WIDGET ---
+class ResourceMonitor(ctk.CTkFrame):
+    """
+    Widget for monitoring system resources (CPU, GPU, VRAM, RAM)
+    Displays percentage values and progress bars
+    """
+    
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, **kwargs)
+        
+        self.monitoring = False
+        self.monitor_thread = None
+        
+        # Data storage
+        self.cpu_percent = 0
+        self.ram_percent = 0
+        self.gpu_percent = 0
+        self.vram_percent = 0
+        
+        self._build_ui()
+    
+    def _build_ui(self):
+        """Build the UI components"""
+        # Configure grid
+        self.grid_columnconfigure(0, weight=1)
+        
+        # Title
+        title_label = ctk.CTkLabel(
+            self,
+            text="📊 Загрузка системы",
+            font=("Segoe UI", 12, "bold")
+        )
+        title_label.grid(row=0, column=0, pady=(5, 10), padx=10, sticky="w")
+        
+        # CPU
+        self.cpu_label = ctk.CTkLabel(
+            self,
+            text="ЦП: 0%",
+            font=("Segoe UI", 10)
+        )
+        self.cpu_label.grid(row=1, column=0, pady=2, padx=10, sticky="w")
+        
+        self.cpu_bar = ctk.CTkProgressBar(self, width=200, height=8)
+        self.cpu_bar.set(0)
+        self.cpu_bar.grid(row=2, column=0, pady=(0, 5), padx=10, sticky="ew")
+        
+        # RAM
+        self.ram_label = ctk.CTkLabel(
+            self,
+            text="ОЗУ: 0%",
+            font=("Segoe UI", 10)
+        )
+        self.ram_label.grid(row=3, column=0, pady=2, padx=10, sticky="w")
+        
+        self.ram_bar = ctk.CTkProgressBar(self, width=200, height=8)
+        self.ram_bar.set(0)
+        self.ram_bar.grid(row=4, column=0, pady=(0, 5), padx=10, sticky="ew")
+        
+        # GPU
+        self.gpu_label = ctk.CTkLabel(
+            self,
+            text="ГП: Н/Д",
+            font=("Segoe UI", 10)
+        )
+        self.gpu_label.grid(row=5, column=0, pady=2, padx=10, sticky="w")
+        
+        self.gpu_bar = ctk.CTkProgressBar(self, width=200, height=8)
+        self.gpu_bar.set(0)
+        self.gpu_bar.grid(row=6, column=0, pady=(0, 5), padx=10, sticky="ew")
+        
+        # VRAM
+        self.vram_label = ctk.CTkLabel(
+            self,
+            text="Видеопамять: Н/Д",
+            font=("Segoe UI", 10)
+        )
+        self.vram_label.grid(row=7, column=0, pady=2, padx=10, sticky="w")
+        
+        self.vram_bar = ctk.CTkProgressBar(self, width=200, height=8)
+        self.vram_bar.set(0)
+        self.vram_bar.grid(row=8, column=0, pady=(0, 10), padx=10, sticky="ew")
+    
+    def _update_metrics(self):
+        """Update resource metrics (called from background thread)"""
+        # CPU
+        if PSUTIL_AVAILABLE:
+            self.cpu_percent = psutil.cpu_percent(interval=0.5)
+        
+        # RAM
+        if PSUTIL_AVAILABLE:
+            mem = psutil.virtual_memory()
+            self.ram_percent = mem.percent
+        
+        # GPU and VRAM
+        if GPUTIL_AVAILABLE:
+            try:
+                gpus = GPUtil.getGPUs()
+                if gpus:
+                    gpu = gpus[0]  # Use first GPU
+                    self.gpu_percent = gpu.load * 100
+                    self.vram_percent = gpu.memoryUtil * 100
+            except Exception:
+                pass
+        elif TORCH_AVAILABLE and torch.cuda.is_available():
+            try:
+                # Fallback to PyTorch CUDA info
+                self.gpu_percent = 0  # PyTorch doesn't provide GPU utilization easily
+                
+                # VRAM usage
+                mem_allocated = torch.cuda.memory_allocated(0)
+                mem_reserved = torch.cuda.memory_reserved(0)
+                mem_total = torch.cuda.get_device_properties(0).total_memory
+                
+                self.vram_percent = (mem_reserved / mem_total) * 100
+            except Exception:
+                pass
+    
+    def _update_ui(self):
+        """Update UI elements (called from main thread)"""
+        try:
+            # Update CPU
+            self.cpu_label.configure(text=f"ЦП: {self.cpu_percent:.1f}%")
+            self.cpu_bar.set(self.cpu_percent / 100.0)
+            
+            # Update RAM
+            self.ram_label.configure(text=f"ОЗУ: {self.ram_percent:.1f}%")
+            self.ram_bar.set(self.ram_percent / 100.0)
+            
+            # Update GPU
+            if self.gpu_percent > 0 or GPUTIL_AVAILABLE:
+                self.gpu_label.configure(text=f"ГП: {self.gpu_percent:.1f}%")
+                self.gpu_bar.set(self.gpu_percent / 100.0)
+            else:
+                self.gpu_label.configure(text="ГП: Н/Д")
+                self.gpu_bar.set(0)
+            
+            # Update VRAM
+            if self.vram_percent > 0 or GPUTIL_AVAILABLE or (TORCH_AVAILABLE and torch.cuda.is_available()):
+                self.vram_label.configure(text=f"Видеопамять: {self.vram_percent:.1f}%")
+                self.vram_bar.set(self.vram_percent / 100.0)
+            else:
+                self.vram_label.configure(text="Видеопамять: Н/Д")
+                self.vram_bar.set(0)
+            
+            # Schedule next update if still monitoring
+            if self.monitoring:
+                self.after(1000, self._update_ui)
+        except Exception:
+            # Widget might be destroyed
+            pass
+    
+    def _monitor_loop(self):
+        """Background thread loop for monitoring"""
+        while self.monitoring:
+            self._update_metrics()
+            time.sleep(1)
+    
+    def start_monitoring(self):
+        """Start monitoring resources"""
+        if not self.monitoring:
+            self.monitoring = True
+            self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+            self.monitor_thread.start()
+            self.after(100, self._update_ui)
+    
+    def stop_monitoring(self):
+        """Stop monitoring resources"""
+        self.monitoring = False
+        if self.monitor_thread:
+            self.monitor_thread.join(timeout=2)
+            self.monitor_thread = None
+
+
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -3075,13 +3331,20 @@ class App(ctk.CTk):
         container = ctk.CTkFrame(self.content_frame)
         container.grid(row=0, column=0, sticky="nsew", padx=40, pady=30)
         container.grid_columnconfigure(0, weight=1)
+        container.grid_columnconfigure(1, weight=0)  # Resource monitor column
+        
+        # === RESOURCE MONITOR (top-right corner) ===
+        self.resource_monitor_rec = ResourceMonitor(container, fg_color=("gray85", "gray20"))
+        self.resource_monitor_rec.grid(row=0, column=1, rowspan=5, sticky="ne", padx=(10, 0), pady=0)
+        # Initially hidden, will show during processing
+        self.resource_monitor_rec.grid_remove()
         
         # Title
         ctk.CTkLabel(
             container,
             text="Запись встречи",
             font=("Segoe UI", 24, "bold")
-        ).grid(row=0, column=0, pady=(0, 20))
+        ).grid(row=0, column=0, pady=(0, 20), sticky="w")
         
         # Host selection
         ctk.CTkLabel(
@@ -3179,15 +3442,22 @@ class App(ctk.CTk):
         container = ctk.CTkFrame(self.content_frame)
         container.grid(row=0, column=0, sticky="nsew", padx=40, pady=30)
         container.grid_columnconfigure(0, weight=1)
+        container.grid_columnconfigure(1, weight=0)  # Resource monitor column
         # Ряд 8 (где лог) должен растягиваться
         container.grid_rowconfigure(8, weight=1) 
+        
+        # === RESOURCE MONITOR (top-right corner) ===
+        self.resource_monitor = ResourceMonitor(container, fg_color=("gray85", "gray20"))
+        self.resource_monitor.grid(row=0, column=1, rowspan=5, sticky="ne", padx=(10, 0), pady=0)
+        # Initially hidden, will show during processing
+        self.resource_monitor.grid_remove()
         
         # Title
         ctk.CTkLabel(
             container,
             text="Анализ записи",
             font=("Segoe UI", 24, "bold")
-        ).grid(row=0, column=0, pady=(0, 20))
+        ).grid(row=0, column=0, pady=(0, 20), sticky="w")
         
         # File selection buttons
         btn_frame = ctk.CTkFrame(container, fg_color="transparent")
@@ -4939,8 +5209,16 @@ class App(ctk.CTk):
         threading.Thread(target=self._run_analysis, args=(path,), daemon=True).start()
 
     def _run_analysis(self, path: str):
+        # Check if using local processing mode
+        is_local_mode = config.get("processing_mode") == "local"
+        
         try:
             self.after(0, lambda: self._show_progress_ui(True)) # Показываем UI
+            
+            # Show resource monitor for local processing
+            if is_local_mode and hasattr(self, 'resource_monitor'):
+                self.after(0, lambda: self.resource_monitor.grid())
+                self.after(0, lambda: self.resource_monitor.start_monitoring())
             
             try:
                 logger.info(f"Starting analysis of: {path}")
@@ -5038,6 +5316,11 @@ class App(ctk.CTk):
             self.after(0, lambda: self._enable_report_buttons())
 
         finally:
+            # Hide and stop resource monitor
+            if is_local_mode and hasattr(self, 'resource_monitor'):
+                self.after(0, lambda: self.resource_monitor.stop_monitoring())
+                self.after(0, lambda: self.resource_monitor.grid_remove())
+            
             self.after(0, lambda: self._show_progress_ui(False)) # Скрываем UI
             if os.path.exists(TEMP_DIR):
                 try: shutil.rmtree(TEMP_DIR)
@@ -5067,8 +5350,20 @@ class App(ctk.CTk):
         threading.Thread(target=self._llm_report_thread, daemon=True).start()
 
     def _llm_report_thread(self):
+        # Check if using local LLM
+        is_local_llm = config.get("llm_provider") == "local"
+        
         self.after(0, lambda: self._show_progress_ui(True))
         self._token_counter = 0
+        
+        # Show resource monitor for local LLM
+        if is_local_llm and hasattr(self, 'resource_monitor'):
+            self.after(0, lambda: self.resource_monitor.grid())
+            self.after(0, lambda: self.resource_monitor.start_monitoring())
+        elif is_local_llm and hasattr(self, 'resource_monitor_rec'):
+            # If on recording page
+            self.after(0, lambda: self.resource_monitor_rec.grid())
+            self.after(0, lambda: self.resource_monitor_rec.start_monitoring())
         
         def on_progress(data):
             is_status_msg = (len(data) > 80 or data.startswith("Анализ") or data.startswith("Сборка") or data.startswith("Режим"))
@@ -5119,6 +5414,14 @@ class App(ctk.CTk):
         except Exception as e:
             self._log(f"Ошибка LLM: {e}")
         finally:
+            # Hide and stop resource monitor
+            if is_local_llm and hasattr(self, 'resource_monitor'):
+                self.after(0, lambda: self.resource_monitor.stop_monitoring())
+                self.after(0, lambda: self.resource_monitor.grid_remove())
+            elif is_local_llm and hasattr(self, 'resource_monitor_rec'):
+                self.after(0, lambda: self.resource_monitor_rec.stop_monitoring())
+                self.after(0, lambda: self.resource_monitor_rec.grid_remove())
+            
             self.after(0, lambda: self._show_progress_ui(False))
 
     # --- работа с базой спикеров ---
