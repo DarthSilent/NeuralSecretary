@@ -601,6 +601,10 @@ DEFAULT_SETTINGS = {
     "or_model": "gpt-4.1-mini",
     "local_model": "qwen2.5:7b",
     "local_url": "http://localhost:11434/v1/chat/completions",
+    "llm_token_limit": 12000,       # Порог токенов
+    "enable_token_limit": True,     # [NEW] Включить проверку лимита токенов
+    "chunk_minutes": 55,            # Размер части
+    "force_time_split": False,      # [NEW] Всегда разбивать на части (независимо от длины)
     "current_prompt_name": "Стандартный",
     "system_prompt": BUILTIN_PROMPTS["Стандартный"],
     "custom_prompts": {},
@@ -1430,24 +1434,132 @@ class DocxGenerator:
 # --- LLM-КЛИЕНТ ---
 
 class LLMClient:
+    def __init__(self):
+        pass
+
+    def _estimate_tokens(self, text: str) -> int:
+        """Оценка токенов (грубая: ~3.5 символа на токен)"""
+        return int(len(text) / 3.5)
+    
+    def _split_transcript_by_time(self, text: str) -> list:
+        """Разбивает стенограмму на части по минутам из конфига"""
+        chunks = []
+        current_chunk = []
+        
+        minutes = config.get("chunk_minutes", 55)
+        if not minutes or minutes <= 0:
+            minutes = 55
+        
+        seconds_limit = minutes * 60
+        current_threshold = seconds_limit
+        
+        lines = text.splitlines()
+        
+        for line in lines:
+            match = re.match(r"^\[(\d+(?:\.\d+)?)\]", line.strip())
+            if match:
+                timestamp = float(match.group(1))
+                if timestamp > current_threshold:
+                    if current_chunk:
+                        chunks.append("\n".join(current_chunk))
+                        current_chunk = []
+                    while timestamp > current_threshold:
+                        current_threshold += seconds_limit
+            
+            current_chunk.append(line)
+        
+        if current_chunk:
+            chunks.append("\n".join(current_chunk))
+            
+        if not chunks:
+            return [text]
+            
+        return chunks
+
     def summarize(self, transcript_text: str, progress_cb=None) -> str:
         """
-        progress_cb: функция, которая вызывается при получении нового кусочка текста.
-                     Сигнатура: progress_cb(chunk: str)
+        Умная суммаризация с гибкой настройкой условий разбиения.
         """
-        prompt_template = config.get("system_prompt") or ""
-        # Заменяем дату в промпте
-        prompt = prompt_template.replace(
+        # Актуальный системный промпт
+        current_system_prompt = config.get("system_prompt") or ""
+        current_system_prompt = current_system_prompt.replace(
             "{date}", datetime.now().strftime("%d.%m.%Y")
         )
 
+        # Считываем настройки
+        token_limit = config.get("llm_token_limit", 12000)
+        use_token_check = config.get("enable_token_limit", True)
+        force_split = config.get("force_time_split", False)
+
+        full_text_tokens = self._estimate_tokens(transcript_text)
+        
+        # ЛОГИКА ПРИНЯТИЯ РЕШЕНИЯ:
+        should_split = force_split or (use_token_check and full_text_tokens > token_limit)
+        
+        # --- ВЕТКА 1: ОДИН ПРОХОД ---
+        if not should_split:
+            if progress_cb:
+                msg = f"Транскрипт ({full_text_tokens} токенов). Обработка одним запросом..."
+                if full_text_tokens > token_limit:
+                    msg += " (Лимит превышен, но разбивка отключена)"
+                progress_cb(msg)
+            return self._call_llm_stream(current_system_prompt, transcript_text, progress_cb)
+        
+        # --- ВЕТКА 2: ИТЕРАТИВНЫЙ РЕЖИМ ---
+        chunks = self._split_transcript_by_time(transcript_text)
+        total_chunks = len(chunks)
+        
+        if total_chunks <= 1:
+            if progress_cb:
+                progress_cb(f"Попытка разбивки, но запись короче заданного интервала. Обработка целиком...")
+            return self._call_llm_stream(current_system_prompt, transcript_text, progress_cb)
+
+        if progress_cb:
+            chunk_min = config.get('chunk_minutes', 55)
+            reason = "Принудительно" if force_split else "Превышен лимит токенов"
+            progress_cb(f"Режим: Итеративный ({reason}). Разбито на {total_chunks} частей (по ~{chunk_min} мин).")
+
+        intermediate_results = []
+        
+        for i, chunk in enumerate(chunks):
+            part_num = i + 1
+            if progress_cb:
+                progress_cb(f"Анализ части {part_num}/{total_chunks}...")
+            
+            chunk_system_prompt = (
+                f"Ты анализируешь ЧАСТЬ {part_num} из {total_chunks} записи встречи.\n"
+                f"Твоя задача — извлечь информацию из этого фрагмента, СТРОГО следуя роли и формату, описанным ниже.\n"
+                f"Не пиши вступлений и общих выводов по всей встрече, пиши только то, что найдено в этом куске.\n\n"
+                f"=== ТВОЯ РОЛЬ И КРИТЕРИИ АНАЛИЗА ===\n"
+                f"{current_system_prompt}\n"
+                f"====================================\n"
+            )
+            
+            part_response = self._call_llm(chunk_system_prompt, chunk, stream=False)
+            intermediate_results.append(f"--- ОТЧЕТ ПО ЧАСТИ {part_num} ---\n{part_response}\n")
+        
+        # Финальная сборка
+        if progress_cb:
+            progress_cb("Консолидация финального отчета...")
+            
+        combined_text = "\n".join(intermediate_results)
+        final_user_message = (
+            "Ниже приведены промежуточные отчеты по разным частям одной встречи.\n"
+            "Объедини их в один связный финальный документ, соблюдая структуру, заданную в системном промпте.\n"
+            "Убери дублирующиеся пункты, объедини смысловые блоки.\n\n"
+            f"МАТЕРИАЛЫ ДЛЯ ОБЪЕДИНЕНИЯ:\n{combined_text}"
+        )
+        
+        return self._call_llm_stream(current_system_prompt, final_user_message, progress_cb)
+
+    def _prepare_request_data(self, system_prompt, user_text, stream=True):
         messages = [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": transcript_text},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text},
         ]
-
+        
         provider = config.get("llm_provider")
-
+        
         if provider == "openrouter":
             url = "https://openrouter.ai/api/v1/chat/completions"
             headers = {
@@ -1458,22 +1570,44 @@ class LLMClient:
             data = {
                 "model": config.get("or_model"),
                 "messages": messages,
-                "stream": True,  # Включаем стриминг
+                "stream": stream,
             }
+            if not stream:
+                data["max_tokens"] = 2500 
+                
         else:
-            # локальный Ollama
             url = config.get("local_url")
             headers = {"Content-Type": "application/json"}
+            ctx = config.get("llm_token_limit", 12000)
             data = {
                 "model": config.get("local_model"),
                 "messages": messages,
-                "stream": True,  # Включаем стриминг
+                "stream": stream,
+                "options": {
+                    "num_ctx": ctx
+                }
             }
-
-        try:
-            # stream=True важен для requests
-            resp = requests.post(url, headers=headers, json=data, stream=True)
             
+        return url, headers, data
+
+    def _call_llm(self, system_prompt, user_text, stream=False) -> str:
+        url, headers, data = self._prepare_request_data(system_prompt, user_text, stream=False)
+        try:
+            resp = requests.post(url, headers=headers, json=data)
+            if resp.status_code != 200:
+                return f"Error {resp.status_code}: {resp.text}"
+            
+            result = resp.json()
+            if "choices" in result and len(result["choices"]) > 0:
+                return result["choices"][0].get("message", {}).get("content", "")
+            return ""
+        except Exception as e:
+            return f"Error: {e}"
+
+    def _call_llm_stream(self, system_prompt, user_text, progress_cb) -> str:
+        url, headers, data = self._prepare_request_data(system_prompt, user_text, stream=True)
+        try:
+            resp = requests.post(url, headers=headers, json=data, stream=True)
             if resp.status_code != 200:
                 try:
                     err_msg = resp.json().get('error', {}).get('message', resp.text)
@@ -1482,34 +1616,28 @@ class LLMClient:
                 return f"Ошибка LLM: {resp.status_code} {err_msg}"
 
             collected_text = []
-            
-            # Читаем поток строка за строкой
             for line in resp.iter_lines():
                 if line:
                     decoded_line = line.decode('utf-8').strip()
                     if decoded_line.startswith("data: "):
-                        json_str = decoded_line[6:]  # Убираем префикс "data: "
+                        json_str = decoded_line[6:]
                         if json_str == "[DONE]":
                             break
                         try:
                             chunk = json.loads(json_str)
-                            # Стандартный формат OpenAI (и Ollama, и OpenRouter)
                             if "choices" in chunk and len(chunk["choices"]) > 0:
                                 delta = chunk["choices"][0].get("delta", {})
                                 content = delta.get("content", "")
                                 if content:
                                     collected_text.append(content)
-                                    # Сообщаем о прогрессе, если передана функция
                                     if progress_cb:
                                         progress_cb(content)
                         except json.JSONDecodeError:
                             pass
-            
             return "".join(collected_text)
 
         except Exception as e:
             return f"Ошибка соединения с LLM: {e}"
-
 
 # --- OLLAMA ---
 
@@ -2772,6 +2900,43 @@ class App(ctk.CTk):
         self._settings_switch_llm_provider(self.settings_llm_provider_var.get())
         
         # --- Библиотека промптов ---
+        # Разделитель для красоты
+        ctk.CTkFrame(tab_llm, height=2, fg_color="gray50").pack(fill="x", padx=10, pady=10)
+
+        frame_tokens = ctk.CTkFrame(tab_llm, fg_color="transparent")
+        frame_tokens.pack(fill="x", padx=20, pady=(5, 0))
+        
+        self.settings_enable_token_limit_var = ctk.BooleanVar(value=config.get("enable_token_limit", True))
+        ctk.CTkCheckBox(
+            frame_tokens, 
+            text="Авто-разбиение при превышении лимита:", 
+            variable=self.settings_enable_token_limit_var,
+            font=("Segoe UI", 12, "bold")
+        ).pack(side="left")
+        
+        self.settings_token_limit_entry = ctk.CTkEntry(tab_llm, placeholder_text="12000")
+        self.settings_token_limit_entry.pack(fill="x", padx=20, pady=(5, 10))
+        self.settings_token_limit_entry.insert(0, str(config.get("llm_token_limit")))
+
+        # --- Настройка 2: Разбивка по времени ---
+        frame_chunks = ctk.CTkFrame(tab_llm, fg_color="transparent")
+        frame_chunks.pack(fill="x", padx=20, pady=(5, 0))
+
+        self.settings_force_time_split_var = ctk.BooleanVar(value=config.get("force_time_split", False))
+        ctk.CTkCheckBox(
+            frame_chunks, 
+            text="Всегда разбивать на части по времени:", 
+            variable=self.settings_force_time_split_var,
+            font=("Segoe UI", 12, "bold")
+        ).pack(side="left")
+        
+        self.settings_chunk_minutes_entry = ctk.CTkEntry(tab_llm, placeholder_text="55")
+        self.settings_chunk_minutes_entry.pack(fill="x", padx=20, pady=(5, 10))
+        self.settings_chunk_minutes_entry.insert(0, str(config.get("chunk_minutes")))
+        
+        # Разделитель
+        ctk.CTkFrame(tab_llm, height=2, fg_color="gray50").pack(fill="x", padx=10, pady=10)
+        # --------------------------------
         frame_prompts = ctk.CTkFrame(tab_llm)
         frame_prompts.pack(fill="x", padx=10, pady=10)
         
@@ -3159,6 +3324,32 @@ class App(ctk.CTk):
         config.set("or_key", self.settings_entry_or_key.get())
         config.set("or_model", self.settings_or_model_var.get())
         config.set("local_model", self.settings_local_model_var.get())
+        try:
+            # 1. Считываем числа из полей ввода
+            t_limit = int(self.settings_token_limit_entry.get().strip())
+            c_min = int(self.settings_chunk_minutes_entry.get().strip())
+            
+            # 2. Проверяем, что числа адекватные
+            if t_limit < 1000:
+                messagebox.showwarning("Настройки", "Лимит токенов слишком мал (мин. 1000).")
+                return
+            if c_min < 1:
+                messagebox.showwarning("Настройки", "Минуты должны быть > 0.")
+                return
+
+            # 3. Сохраняем числа в конфиг
+            config.set("llm_token_limit", t_limit)
+            config.set("chunk_minutes", c_min)
+            
+            # 4. Сохраняем состояние новых чекбоксов (True/False)
+            config.set("enable_token_limit", self.settings_enable_token_limit_var.get())
+            config.set("force_time_split", self.settings_force_time_split_var.get())
+            
+        except ValueError:
+            # Если пользователь ввел буквы вместо цифр
+            messagebox.showerror("Ошибка", "Лимит токенов и минуты должны быть целыми числами.")
+            return
+
         
         # Prompts
         config.set("current_prompt_name", self.settings_current_prompt_name_var.get())
