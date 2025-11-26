@@ -138,6 +138,8 @@ if not exist requirements.txt (
         echo GPUtil^>=1.4.0
         echo nvidia-cublas-cu12^>=12.1.0.26
         echo nvidia-cudnn-cu12^>=8.9.0.131
+        echo psutil^>=5.9.0
+        echo GPUtil^>=1.4.0
     ) > requirements.txt
 )
 
@@ -152,23 +154,29 @@ echo [Step 4/8] Checking Ollama (optional)...
 echo.
 
 ollama --version >nul 2>&1
-if !errorlevel! neq 0 (
-    echo Ollama not found.
+ollama --version >nul 2>&1
+if !errorlevel! equ 0 goto :OllamaInstalled
+
+:OllamaMissing
+echo Ollama not found.
+echo.
+echo Ollama provides local LLM support (recommended but optional).
+echo Download from: https://ollama.com/download
+echo.
+choice /C YN /M "Continue without Ollama"
+if errorlevel 2 (
     echo.
-    echo Ollama provides local LLM support (recommended but optional).
-    echo Download from: https://ollama.com/download
-    echo.
-    choice /C YN /M "Continue without Ollama"
-    if errorlevel 2 (
-        echo.
-        echo Please install Ollama and run this script again.
-        pause
-        exit /b 1
-    )
-) else (
-    echo Ollama is installed.
-    start /min ollama serve
+    echo Please install Ollama and run this script again.
+    pause
+    exit /b 1
 )
+goto :Step4Done
+
+:OllamaInstalled
+echo Ollama is installed.
+start /min ollama serve
+
+:Step4Done
 
 echo.
 
@@ -259,19 +267,20 @@ if not exist run_app.bat (
 
 :: Download Ollama model
 ollama --version >nul 2>&1
-if !errorlevel! equ 0 (
-    echo.
-    echo Ollama is available. Recommended model: qwen2.5:14b (7GB)
-    echo.
-    choice /C YN /M "Download qwen2.5:14b now"
-    if errorlevel 1 (
-        if not errorlevel 2 (
-            echo.
-            echo Downloading model...
-            ollama pull qwen2.5:14b
-        )
-    )
-)
+ollama --version >nul 2>&1
+if !errorlevel! neq 0 goto :SkipModelDownload
+
+echo.
+echo Ollama is available. Recommended model: qwen2.5:14b (7GB)
+echo.
+choice /C YN /M "Download qwen2.5:14b now"
+if errorlevel 2 goto :SkipModelDownload
+
+echo.
+echo Downloading model...
+ollama pull qwen2.5:14b
+
+:SkipModelDownload
 
 :: ==============================================
 :: COMPLETE
